@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class Applicability(StrEnum):
@@ -56,15 +56,17 @@ class EvidenceReference(BaseModel):
     id: str
     path: str
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    captured_at: datetime
+    captured_at: AwareDatetime
     source: str
     run_id: str
-    fresh_until: datetime | None = None
+    fresh_until: AwareDatetime | None = None
 
     def is_fresh(self, at: datetime | None = None) -> bool:
         if self.fresh_until is None:
             return True
         checked_at = at or datetime.now(tz=UTC)
+        if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+            raise ValueError("freshness checks require a timezone-aware datetime")
         return checked_at <= self.fresh_until
 
 
@@ -141,6 +143,8 @@ class ClaimEvaluation(BaseModel):
             return DisplayState.ERROR
         if any(d.effect == DefeaterEffect.BLOCKS_ATTRIBUTION for d in active):
             return DisplayState.UNKNOWN
+        if any(d.effect == DefeaterEffect.LIMITS_SCOPE for d in active):
+            return DisplayState.UNKNOWN
         if self.quality_failures():
             return DisplayState.UNKNOWN
         if self.support == SupportState.CONFLICTING:
@@ -154,6 +158,8 @@ class ClaimEvaluation(BaseModel):
         if self.support == SupportState.INSUFFICIENT:
             return DisplayState.UNKNOWN
         if self.support == SupportState.SUPPORTED:
+            if not self.evidence_ids:
+                return DisplayState.UNKNOWN
             return DisplayState.PASS
         raise AssertionError(f"unhandled support state: {self.support}")
 
@@ -200,4 +206,3 @@ def enforce_required_children(
         )
     )
     return copied
-

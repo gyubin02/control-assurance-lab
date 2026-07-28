@@ -1,3 +1,8 @@
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import ValidationError
+
 from assurance_lab.claims import (
     Applicability,
     ClaimDependency,
@@ -6,6 +11,7 @@ from assurance_lab.claims import (
     DefeaterEffect,
     DisplayState,
     EvidenceQuality,
+    EvidenceReference,
     ExecutionState,
     QualityState,
     SupportState,
@@ -84,6 +90,51 @@ def test_attribution_defeater_yields_unknown_not_pass() -> None:
     assert result.display_state() == DisplayState.UNKNOWN
 
 
+def test_scope_defeater_yields_unknown_not_pass() -> None:
+    result = evaluation("export-access-protected", SupportState.SUPPORTED)
+    result.defeaters.append(
+        Defeater(
+            id="only-one-endpoint-tested",
+            statement="Only the CSV endpoint was tested; the claim includes PDF export.",
+            effect=DefeaterEffect.LIMITS_SCOPE,
+            active=True,
+        )
+    )
+
+    assert result.display_state() == DisplayState.UNKNOWN
+
+
+def test_supported_claim_without_evidence_cannot_pass() -> None:
+    result = evaluation("detect-bulk-export", SupportState.SUPPORTED)
+    result.evidence_ids = []
+
+    assert result.display_state() == DisplayState.UNKNOWN
+
+
+def test_evidence_timestamps_must_be_timezone_aware() -> None:
+    with pytest.raises(ValidationError):
+        EvidenceReference(
+            id="ev-1",
+            path="evidence/log.json",
+            sha256="a" * 64,
+            captured_at=datetime(2026, 7, 29),
+            source="audit-log",
+            run_id="run-1",
+        )
+
+    reference = EvidenceReference(
+        id="ev-2",
+        path="evidence/log.json",
+        sha256="b" * 64,
+        captured_at=datetime(2026, 7, 29, tzinfo=UTC),
+        source="audit-log",
+        run_id="run-1",
+        fresh_until=datetime(2026, 7, 31, tzinfo=UTC),
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        reference.is_fresh(datetime(2026, 7, 30))
+
+
 def test_not_applicable_requires_rationale() -> None:
     result = ClaimEvaluation(
         claim_id="ot-safety",
@@ -95,4 +146,3 @@ def test_not_applicable_requires_rationale() -> None:
     )
 
     assert result.display_state() == DisplayState.NOT_APPLICABLE
-
