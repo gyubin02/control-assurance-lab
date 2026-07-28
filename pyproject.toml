@@ -17,6 +17,9 @@ dependencies = [
   "rfc8785>=0.1.4,<1",
 ]
 
+[project.scripts]
+assurance-lab = "assurance_lab.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "hypothesis>=6.130,<7",

@@ -716,6 +716,7 @@ class FinancialSupportBundleRepository:
             raise FinancialSupportBundleError(f"bundle integrity verification failed: {detail}")
         self.bundle_id = verification.bundle_id
         self._manifest = verification.manifest
+        self.bundle_profile = self._manifest.profile
 
         spec = self._read_rehashed(_SPEC_PATH)
         try:
