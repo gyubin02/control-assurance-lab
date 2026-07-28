@@ -64,6 +64,6 @@ checklist items.
 
 ## Release gate
 
-There will be no public “complete” release until the benchmark contains at least one
-case where each baseline produces false assurance and the proposed evaluator identifies
-the seeded defect for a reason visible in the raw evidence.
+There will be no first public release until the final-outcome-only baseline produces
+false assurance on the masked case and the proposed evaluator identifies the upstream
+defect for a reason visible in the raw evidence.
