@@ -14,7 +14,7 @@ build/
 runs/
 evidence/
 !src/assurance_lab/evidence/
-!src/assurance_lab/evidence/**
+!src/assurance_lab/evidence/*.py
 
 # Local secrets and operator-specific overrides.
 .env
