@@ -83,6 +83,51 @@ class SessionReadback:
 
 
 @dataclass(frozen=True, slots=True)
+class PrincipalReadback:
+    principal_id: str
+    role: str
+    quarantined: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MutationReceipt:
+    component: Literal["session-revoker", "principal-quarantine"]
+    operation: Literal["not-triggered", "report-only", "revoke-exact", "quarantine"]
+    principal_id: str
+    session_id: str | None
+    rows_affected: int
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayDecisionReceipt:
+    query_id: str
+    principal_id: str
+    session_id: str
+    session_found: bool
+    principal_found: bool
+    session_revoked: bool
+    principal_quarantined: bool
+    available: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceIdentityReceipt:
+    requested_clone_nonce: str
+    requested_runner_resource_id: str
+    observed_clone_nonce: str
+    observed_runner_resource_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupProbeReceipt:
+    clone_nonce: str
+    runner_resource_id: str
+    probe_operation: Literal["select-runtime-identity-after-close"]
+    error_type: Literal["sqlite3.ProgrammingError"]
+    closed_handle_rejected_operation: Literal[True]
+
+
+@dataclass(frozen=True, slots=True)
 class FinancialResponseRuntimeResult:
     trace_id: str
     action_digest: str
@@ -97,6 +142,18 @@ class FinancialResponseRuntimeResult:
     target_modified_session_ids: tuple[str, ...]
     compensator_modified_session_ids: tuple[str, ...]
     session_readbacks: tuple[SessionReadback, ...]
+    principal_readbacks: tuple[PrincipalReadback, ...]
+    sessions_before_target: tuple[SessionReadback, ...]
+    sessions_after_target: tuple[SessionReadback, ...]
+    sessions_after_compensator: tuple[SessionReadback, ...]
+    principals_before_target: tuple[PrincipalReadback, ...]
+    principals_after_target: tuple[PrincipalReadback, ...]
+    principals_after_compensator: tuple[PrincipalReadback, ...]
+    target_mutation: MutationReceipt
+    compensator_mutation: MutationReceipt
+    gateway_decisions: tuple[GatewayDecisionReceipt, ...]
+    resource_identity: ResourceIdentityReceipt
+    cleanup_probe: CleanupProbeReceipt
     events: tuple[RuntimeEvent, ...]
 
     def session(self, session_id: str) -> SessionReadback:
@@ -136,8 +193,14 @@ class FinancialResponseRuntime:
         selector: CellSelector,
         *,
         trace_id: str,
+        clone_nonce: str | None = None,
+        runner_resource_id: str = "financial-response-sqlite-runner",
     ) -> FinancialResponseRuntimeResult:
         _validate_trace_id(trace_id)
+        if clone_nonce is None:
+            clone_nonce = f"runtime-clone-{trace_id}"
+        _validate_resource_text(clone_nonce, "clone_nonce")
+        _validate_resource_text(runner_resource_id, "runner_resource_id")
         input_level = _string_level(selector.input, "input")
         target_level = _string_level(selector.target, "target")
         compensator_level = _string_level(selector.compensator, "compensator")
@@ -165,18 +228,32 @@ class FinancialResponseRuntime:
         ):
             raise RuntimeError("fixed action no longer matches its contracted digest")
 
-        connection = self._fresh_database()
+        connection = self._fresh_database(
+            clone_nonce=clone_nonce,
+            runner_resource_id=runner_resource_id,
+        )
         if sham_level == SHAM_RELOAD.value:
-            connection.close()
-            connection = self._fresh_database()
+            _close_with_probe(
+                connection,
+                clone_nonce=clone_nonce,
+                runner_resource_id=runner_resource_id,
+            )
+            connection = self._fresh_database(
+                clone_nonce=clone_nonce,
+                runner_resource_id=runner_resource_id,
+            )
 
         attack_triggered = input_level == ATTACK.value
+        resource_identity = _resource_identity(connection)
         before_target = _session_states(connection)
+        principals_before_target = _principal_states(connection)
         exact_revocation_executed = (
             attack_triggered and target_level == TARGET_EFFECTIVE.value
         )
+        target_operation: Literal["not-triggered", "report-only", "revoke-exact"]
+        target_rows_affected = 0
         if exact_revocation_executed:
-            affected = connection.execute(
+            target_rows_affected = connection.execute(
                 """
                 UPDATE sessions
                 SET revoked = 1
@@ -184,11 +261,17 @@ class FinancialResponseRuntime:
                 """,
                 (COMPROMISED_SESSION_ID, COMPROMISED_PRINCIPAL_ID),
             ).rowcount
-            if affected != 1:
+            if target_rows_affected != 1:
                 connection.close()
                 raise RuntimeError("exact-session revocation did not affect one session")
             connection.commit()
+            target_operation = "revoke-exact"
+        elif attack_triggered:
+            target_operation = "report-only"
+        else:
+            target_operation = "not-triggered"
         after_target = _session_states(connection)
+        principals_after_target = _principal_states(connection)
         target_modified = _changed_session_ids(before_target, after_target)
         expected_target_modified = (
             (COMPROMISED_SESSION_ID,) if exact_revocation_executed else ()
@@ -201,16 +284,18 @@ class FinancialResponseRuntime:
         quarantine_applied = (
             attack_triggered and compensator_level == COMPENSATOR_ON.value
         )
+        compensator_rows_affected = 0
         if quarantine_applied:
-            affected = connection.execute(
+            compensator_rows_affected = connection.execute(
                 "UPDATE principals SET quarantined = 1 WHERE principal_id = ?",
                 (COMPROMISED_PRINCIPAL_ID,),
             ).rowcount
-            if affected != 1:
+            if compensator_rows_affected != 1:
                 connection.close()
                 raise RuntimeError("principal quarantine did not affect one principal")
             connection.commit()
         after_compensator = _session_states(connection)
+        principals_after_compensator = _principal_states(connection)
         compensator_modified = _changed_session_ids(
             before_compensator,
             after_compensator,
@@ -229,27 +314,33 @@ class FinancialResponseRuntime:
             connection,
             COMPROMISED_PRINCIPAL_ID,
         )
-        replay_available = _request_available(
+        replay_decision = _request_decision(
             connection,
+            query_id="probe-compromised-session-replay",
             principal_id=COMPROMISED_PRINCIPAL_ID,
             session_id=COMPROMISED_SESSION_ID,
         )
-        unrelated_available = _request_available(
+        unrelated_decision = _request_decision(
             connection,
+            query_id="probe-unrelated-support-action",
             principal_id=UNRELATED_PRINCIPAL_ID,
             session_id=UNRELATED_SESSION_ID,
         )
-        readbacks = tuple(
-            SessionReadback(
-                session_id=session_id,
-                principal_id=principal_id,
-                active=active,
-            )
-            for session_id, (principal_id, active) in sorted(
-                after_compensator.items()
-            )
+        sessions_before_target = _session_readbacks(before_target)
+        sessions_after_target = _session_readbacks(after_target)
+        sessions_after_compensator = _session_readbacks(after_compensator)
+        principals_before = _principal_readbacks(principals_before_target)
+        principals_after_target_readback = _principal_readbacks(
+            principals_after_target
         )
-        connection.close()
+        principals_after_compensator_readback = _principal_readbacks(
+            principals_after_compensator
+        )
+        cleanup_probe = _close_with_probe(
+            connection,
+            clone_nonce=clone_nonce,
+            runner_resource_id=runner_resource_id,
+        )
 
         status = (
             ResponseActionStatus.REPORTED_SUCCESS
@@ -271,8 +362,8 @@ class FinancialResponseRuntime:
             quarantine_applied=quarantine_applied,
             compromised_principal_quarantined=compromised_principal_quarantined,
             compensator_modified_session_ids=compensator_modified,
-            replay_denied=not replay_available,
-            unrelated_available=unrelated_available,
+            replay_denied=not replay_decision.available,
+            unrelated_available=unrelated_decision.available,
         )
         return FinancialResponseRuntimeResult(
             trace_id=trace_id,
@@ -285,17 +376,53 @@ class FinancialResponseRuntime:
             compromised_session_active=compromised_session_active,
             non_target_sessions_active=non_target_sessions_active,
             compromised_principal_quarantined=compromised_principal_quarantined,
-            compromised_session_replay_denied=not replay_available,
-            unrelated_support_principal_available=unrelated_available,
+            compromised_session_replay_denied=not replay_decision.available,
+            unrelated_support_principal_available=unrelated_decision.available,
             target_modified_session_ids=target_modified,
             compensator_modified_session_ids=compensator_modified,
-            session_readbacks=readbacks,
+            session_readbacks=sessions_after_compensator,
+            principal_readbacks=principals_after_compensator_readback,
+            sessions_before_target=sessions_before_target,
+            sessions_after_target=sessions_after_target,
+            sessions_after_compensator=sessions_after_compensator,
+            principals_before_target=principals_before,
+            principals_after_target=principals_after_target_readback,
+            principals_after_compensator=principals_after_compensator_readback,
+            target_mutation=MutationReceipt(
+                component="session-revoker",
+                operation=target_operation,
+                principal_id=COMPROMISED_PRINCIPAL_ID,
+                session_id=COMPROMISED_SESSION_ID,
+                rows_affected=target_rows_affected,
+            ),
+            compensator_mutation=MutationReceipt(
+                component="principal-quarantine",
+                operation=("quarantine" if quarantine_applied else "not-triggered"),
+                principal_id=COMPROMISED_PRINCIPAL_ID,
+                session_id=None,
+                rows_affected=compensator_rows_affected,
+            ),
+            gateway_decisions=(replay_decision, unrelated_decision),
+            resource_identity=resource_identity,
+            cleanup_probe=cleanup_probe,
             events=events,
         )
 
     @staticmethod
-    def _fresh_database() -> sqlite3.Connection:
+    def _fresh_database(
+        *,
+        clone_nonce: str,
+        runner_resource_id: str,
+    ) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
+        connection.execute(
+            """
+            CREATE TABLE runtime_identity (
+                clone_nonce TEXT PRIMARY KEY,
+                runner_resource_id TEXT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             CREATE TABLE principals (
@@ -344,6 +471,10 @@ class FinancialResponseRuntime:
                     0,
                 ),
             ),
+        )
+        connection.execute(
+            "INSERT INTO runtime_identity VALUES (?, ?)",
+            (clone_nonce, runner_resource_id),
         )
         connection.commit()
         return connection
@@ -412,6 +543,11 @@ def _validate_trace_id(trace_id: str) -> None:
         raise ValueError("trace_id must be 1-128 safe identifier characters")
 
 
+def _validate_resource_text(value: str, name: str) -> None:
+    if not _TRACE_ID.fullmatch(value):
+        raise ValueError(f"{name} must be 1-128 safe identifier characters")
+
+
 def _required_text(action: dict[str, Any], name: str) -> str:
     value = action.get(name)
     if not isinstance(value, str):
@@ -429,6 +565,65 @@ def _session_states(
         str(session_id): (str(principal_id), not bool(revoked))
         for session_id, principal_id, revoked in rows
     }
+
+
+def _principal_states(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[str, bool]]:
+    rows = connection.execute(
+        "SELECT principal_id, role, quarantined FROM principals ORDER BY principal_id"
+    )
+    return {
+        str(principal_id): (str(role), bool(quarantined))
+        for principal_id, role, quarantined in rows
+    }
+
+
+def _session_readbacks(
+    states: dict[str, tuple[str, bool]],
+) -> tuple[SessionReadback, ...]:
+    return tuple(
+        SessionReadback(
+            session_id=session_id,
+            principal_id=principal_id,
+            active=active,
+        )
+        for session_id, (principal_id, active) in sorted(states.items())
+    )
+
+
+def _principal_readbacks(
+    states: dict[str, tuple[str, bool]],
+) -> tuple[PrincipalReadback, ...]:
+    return tuple(
+        PrincipalReadback(
+            principal_id=principal_id,
+            role=role,
+            quarantined=quarantined,
+        )
+        for principal_id, (role, quarantined) in sorted(states.items())
+    )
+
+
+def _resource_identity(connection: sqlite3.Connection) -> ResourceIdentityReceipt:
+    rows = tuple(
+        connection.execute(
+            """
+            SELECT clone_nonce, runner_resource_id
+            FROM runtime_identity
+            ORDER BY clone_nonce
+            """
+        )
+    )
+    if len(rows) != 1:
+        raise RuntimeError("runtime identity table must contain exactly one row")
+    clone_nonce, runner_resource_id = rows[0]
+    return ResourceIdentityReceipt(
+        requested_clone_nonce=str(clone_nonce),
+        requested_runner_resource_id=str(runner_resource_id),
+        observed_clone_nonce=str(clone_nonce),
+        observed_runner_resource_id=str(runner_resource_id),
+    )
 
 
 def _changed_session_ids(
@@ -457,25 +652,59 @@ def _principal_quarantined(
     return bool(row[0])
 
 
-def _request_available(
+def _request_decision(
     connection: sqlite3.Connection,
     *,
+    query_id: str,
     principal_id: str,
     session_id: str,
-) -> bool:
-    row = connection.execute(
-        """
-        SELECT s.revoked, p.quarantined
-        FROM sessions AS s
-        JOIN principals AS p ON p.principal_id = s.principal_id
-        WHERE s.session_id = ? AND s.principal_id = ?
-        """,
-        (session_id, principal_id),
+) -> GatewayDecisionReceipt:
+    session_row = connection.execute(
+        "SELECT principal_id, revoked FROM sessions WHERE session_id = ?",
+        (session_id,),
     ).fetchone()
-    if row is None:
-        raise RuntimeError("request references a missing principal/session binding")
-    revoked, quarantined = row
-    return not bool(revoked) and not bool(quarantined)
+    principal_row = connection.execute(
+        "SELECT quarantined FROM principals WHERE principal_id = ?",
+        (principal_id,),
+    ).fetchone()
+    session_found = session_row is not None
+    principal_found = principal_row is not None
+    bound = session_found and str(session_row[0]) == principal_id
+    revoked = bool(session_row[1]) if bound else False
+    quarantined = bool(principal_row[0]) if principal_found else False
+    available = bound and principal_found and not revoked and not quarantined
+    return GatewayDecisionReceipt(
+        query_id=query_id,
+        principal_id=principal_id,
+        session_id=session_id,
+        session_found=session_found,
+        principal_found=principal_found,
+        session_revoked=revoked,
+        principal_quarantined=quarantined,
+        available=available,
+    )
+
+
+def _close_with_probe(
+    connection: sqlite3.Connection,
+    *,
+    clone_nonce: str,
+    runner_resource_id: str,
+) -> CleanupProbeReceipt:
+    connection.close()
+    try:
+        connection.execute(
+            "SELECT clone_nonce, runner_resource_id FROM runtime_identity"
+        )
+    except sqlite3.ProgrammingError:
+        return CleanupProbeReceipt(
+            clone_nonce=clone_nonce,
+            runner_resource_id=runner_resource_id,
+            probe_operation="select-runtime-identity-after-close",
+            error_type="sqlite3.ProgrammingError",
+            closed_handle_rejected_operation=True,
+        )
+    raise RuntimeError("closed SQLite handle unexpectedly accepted a query")
 
 
 def _events(
