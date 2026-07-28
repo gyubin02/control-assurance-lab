@@ -28,21 +28,30 @@ The larger system will use that answer to connect technical tests to control cla
 5. Missing, stale, contradictory, or poorly sourced evidence produces an explicit non-pass result.
 6. Another person can rerun the experiment and verify the evidence bundle without receiving a real secret.
 
-## Full intended scope
+## First public result
 
-The finished work is intended to contain:
+The first release earns one claim before it grows:
 
-- a declarative claim and experiment format;
-- an isolated experiment runner with setup, intervention, replay, observation, rollback, and cleanup;
-- a claim-level evidence graph;
-- preventive, detective, response, and recovery control tests;
-- financial-services and manufacturing/R&D scenario packs;
-- deliberate control defects with ground-truth labels;
-- baselines for configuration-only and single-run attack testing;
-- a benchmark for false assurance, defect localization, masking, evidence adequacy, and reproducibility;
-- a practical web interface and a command-line interface;
-- portable evidence bundles, verification, and optional OSCAL export;
-- a Korean study trail that explains the system from first principles.
+> A downstream release guard stopped all 10 records, but the upstream entitlement
+> check still selected all 10. The evaluator exposes the upstream failure instead of
+> reporting one green end-to-end result.
+
+That result must be produced by a real replay over a disposable synthetic financial
+dataset. A second process must be able to verify the bundle, extract the observations,
+and recalculate the same decision. Reusing evidence from another trial, changing the
+scope, breaking the benign request, or failing cleanup must prevent a positive result.
+
+The public surface for this result is deliberately small:
+
+- the experiment contract;
+- the runner and raw evidence bundle;
+- the independent verifier and decision;
+- one comparison with a final-outcome-only baseline; and
+- one short explanation of what the raw records show.
+
+Other scenario packs, compliance export, broad control libraries, and a general
+dashboard wait until this result survives the benchmark. They are not release
+checklist items.
 
 ## Claims deliberately not made
 
@@ -58,4 +67,3 @@ The finished work is intended to contain:
 There will be no public “complete” release until the benchmark contains at least one
 case where each baseline produces false assurance and the proposed evaluator identifies
 the seeded defect for a reason visible in the raw evidence.
-
