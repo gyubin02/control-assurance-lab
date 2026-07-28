@@ -22,6 +22,7 @@ from assurance_lab.contract import (
     BooleanValue,
     CellSelector,
     CompiledExperiment,
+    ExperimentContract,
     IntegerValue,
     Stage,
     compile_experiment,
@@ -87,6 +88,7 @@ _CLEANUP_PATH = "artifacts/cleanup-observations.jsonl"
 _TRIAL_PATH = "records/trial-records.jsonl"
 _SPEC_PATH = "spec/experiment.json"
 _DATASET_PATH = "spec/dataset-manifest.json"
+_FIXTURE_PATH = "spec/fixture-manifest.json"
 _RUNNER_RESOURCE_ID = "financial-support-sqlite-runner"
 _BUILD_DESCRIPTOR = {
     "schema": "assurance-lab.financial-support-runtime-build/v1",
@@ -122,6 +124,45 @@ class _ArtifactModel(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
+
+
+class _BundledContractArtifact(_ArtifactModel):
+    contract_schema: Literal["assurance-lab.preventive-non-masking.v3"]
+    contract: ExperimentContract
+
+
+class _DatasetCounts(_ArtifactModel):
+    accounts: int = Field(ge=0)
+    customers: int = Field(ge=0)
+    principals: int = Field(ge=0)
+    support_cases: int = Field(ge=0)
+    transactions: int = Field(ge=0)
+
+
+class _DatasetManifestArtifact(_ArtifactModel):
+    schema_id: Literal["assurance.synthetic-dataset/v1"] = Field(alias="schema")
+    generator_version: Literal["financial-support-data/v1"]
+    seed: int
+    profile: Literal["smoke", "default", "benchmark"]
+    counts: _DatasetCounts
+    logical_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class _FixtureManifestArtifact(_ArtifactModel):
+    schema_id: Literal["assurance-lab.financial-support-fixture/v1"] = Field(alias="schema")
+    dataset: _DatasetManifestArtifact
+    bulk_threshold_records: Literal[10]
+    attack_action_digest: Digest
+    benign_action_digest: Digest
+
+    @model_validator(mode="after")
+    def fixed_actions(self) -> _FixtureManifestArtifact:
+        if (
+            self.attack_action_digest != ATTACK_ACTION_DIGEST
+            or self.benign_action_digest != BENIGN_ACTION_DIGEST
+        ):
+            raise ValueError("fixture manifest action digests do not match the scenario")
+        return self
 
 
 class StageDatum(_ArtifactModel):
@@ -257,7 +298,12 @@ def _payload(
 
 
 class FinancialSupportExperimentRunner:
-    """Execute exactly one compiler-owned 16-cell plan and write raw evidence."""
+    """Execute one simulated 16-cell plan and write its raw evidence.
+
+    A truthful wall-clock lifecycle needs separate execute and assessment
+    finalization phases and is intentionally not implemented by this one-shot
+    runner.
+    """
 
     def __init__(
         self,
@@ -265,13 +311,16 @@ class FinancialSupportExperimentRunner:
         *,
         bulk_threshold_records: int = 10,
         clock: Callable[[], datetime] | None = None,
-        time_basis: TimeBasis = "wall-clock-observation",
+        time_basis: TimeBasis | None = None,
     ) -> None:
-        if time_basis == "simulated" and clock is None:
-            raise ValueError("a simulated time basis requires an explicit clock")
-        self._dataset = dataset
-        self._bulk_threshold_records = bulk_threshold_records
-        self._clock = clock or _utc_now
+        if time_basis != "simulated" or clock is None:
+            raise ValueError(
+                "the one-shot runner requires an explicit simulated time basis and clock; "
+                "wall-clock finalization is not implemented"
+            )
+        if bulk_threshold_records != 10:
+            raise ValueError("the financial-support fixture fixes the bulk threshold at 10")
+        self._clock = clock
         self._time_basis = time_basis
         self._runtime = FinancialSupportRuntime(
             dataset,
@@ -280,15 +329,14 @@ class FinancialSupportExperimentRunner:
         self._dataset_manifest = dataset.manifest()
         self.build_digest = FINANCIAL_SUPPORT_RUNTIME_BUILD_DIGEST
         self.dataset_digest = f"sha256:{self._dataset_manifest['logical_digest']}"
-        self.fixture_digest = _digest_value(
-            {
-                "schema": "assurance-lab.financial-support-fixture/v1",
-                "dataset": self._dataset_manifest,
-                "bulk_threshold_records": bulk_threshold_records,
-                "attack_action_digest": ATTACK_ACTION_DIGEST,
-                "benign_action_digest": BENIGN_ACTION_DIGEST,
-            }
-        )
+        self._fixture_manifest = {
+            "schema": "assurance-lab.financial-support-fixture/v1",
+            "dataset": self._dataset_manifest,
+            "bulk_threshold_records": bulk_threshold_records,
+            "attack_action_digest": ATTACK_ACTION_DIGEST,
+            "benign_action_digest": BENIGN_ACTION_DIGEST,
+        }
+        self.fixture_digest = _digest_value(self._fixture_manifest)
 
     def run(
         self,
@@ -469,6 +517,14 @@ class FinancialSupportExperimentRunner:
                 sensitivity=Sensitivity.SYNTHETIC,
                 required_for=("scope", "attestation"),
             ),
+            PayloadFile(
+                path=_FIXTURE_PATH,
+                content=canonical_json_bytes(self._fixture_manifest),
+                media_type="application/json",
+                role="financial-support executable fixture manifest",
+                sensitivity=Sensitivity.SYNTHETIC,
+                required_for=("scope", "attestation"),
+            ),
             _payload(
                 _STAGE_PATH,
                 tuple(stages),
@@ -510,7 +566,7 @@ class FinancialSupportExperimentRunner:
                     evaluator=EvaluatorRef(
                         name="assurance-lab",
                         version="0.0.1",
-                        source_revision="financial-support-e2e-v1",
+                        source_revision="financial-support-e2e-simulated-v1",
                         image_digest=None,
                     ),
                 ),
@@ -660,15 +716,91 @@ class FinancialSupportBundleRepository:
             raise FinancialSupportBundleError(f"bundle integrity verification failed: {detail}")
         self.bundle_id = verification.bundle_id
         self._manifest = verification.manifest
-        if self._manifest.experiment.id != SCENARIO_ID:
-            raise FinancialSupportBundleError("bundle contains the wrong scenario")
 
         spec = self._read_rehashed(_SPEC_PATH)
+        try:
+            bundled_spec = _BundledContractArtifact.model_validate_json(
+                spec,
+                strict=True,
+            )
+            compiled = compile_experiment(bundled_spec.contract)
+        except ValueError as error:
+            raise FinancialSupportBundleError(
+                f"bundled experiment contract failed strict compilation: {error}"
+            ) from error
+        if compiled.canonical_spec.encode("utf-8") != spec:
+            raise FinancialSupportBundleError(
+                "bundled experiment bytes differ from the compiler canonical form"
+            )
+        if compiled.spec_digest != _sha256(spec):
+            raise FinancialSupportBundleError(
+                "compiler spec digest differs from the canonical bundled bytes"
+            )
+        if (
+            self._manifest.experiment.id != compiled.contract.id
+            or self._manifest.experiment.spec_version != compiled.contract.version
+            or self._manifest.experiment.spec_digest != compiled.spec_digest
+        ):
+            raise FinancialSupportBundleError(
+                "bundle manifest experiment reference does not match the bundled contract"
+            )
+        scope = compiled.contract.scope
+        if (
+            self._manifest.evaluation.policy_id != scope.evidence_policy.id
+            or self._manifest.evaluation.policy_digest != scope.evidence_policy.digest
+        ):
+            raise FinancialSupportBundleError(
+                "bundle manifest evidence policy does not match the bundled contract"
+            )
+        if compiled.contract.id != SCENARIO_ID:
+            raise FinancialSupportBundleError("bundle contains the wrong scenario")
+        self.compiled_experiment = compiled
+
+        dataset_bytes = self._read_rehashed(_DATASET_PATH)
+        fixture_bytes = self._read_rehashed(_FIXTURE_PATH)
+        try:
+            dataset_manifest = _DatasetManifestArtifact.model_validate_json(
+                dataset_bytes,
+                strict=True,
+            )
+            fixture_manifest = _FixtureManifestArtifact.model_validate_json(
+                fixture_bytes,
+                strict=True,
+            )
+        except ValueError as error:
+            raise FinancialSupportBundleError(
+                f"bundle provenance manifest failed strict validation: {error}"
+            ) from error
+        if (
+            canonical_json_bytes(dataset_manifest.model_dump(mode="json", by_alias=True))
+            != dataset_bytes
+            or canonical_json_bytes(fixture_manifest.model_dump(mode="json", by_alias=True))
+            != fixture_bytes
+        ):
+            raise FinancialSupportBundleError(
+                "bundle provenance manifest differs from its strict canonical model"
+            )
+        if fixture_manifest.dataset != dataset_manifest:
+            raise FinancialSupportBundleError(
+                "fixture manifest embeds a different dataset manifest"
+            )
+        self.dataset_digest = f"sha256:{dataset_manifest.logical_digest}"
+        self.fixture_digest = _sha256(fixture_bytes)
+        if (
+            self.dataset_digest != scope.dataset_digest
+            or self.fixture_digest != scope.fixture_digest
+        ):
+            raise FinancialSupportBundleError(
+                "dataset or fixture manifest digest does not match the bundled contract scope"
+            )
+        if scope.build_digest != FINANCIAL_SUPPORT_RUNTIME_BUILD_DIGEST:
+            raise FinancialSupportBundleError(
+                "bundled contract build digest does not match the executable runtime"
+            )
         if _sha256(spec) != self._manifest.experiment.spec_digest:
             raise FinancialSupportBundleError(
                 "canonical experiment bytes do not match the manifest spec digest"
             )
-        self._read_rehashed(_DATASET_PATH)
         stage_entries = _parse_jsonl_models(
             self._read_rehashed(_STAGE_PATH),
             FinancialSupportStageArtifact,
@@ -711,6 +843,20 @@ class FinancialSupportBundleRepository:
             key=lambda entry: entry[0].record.trial_key,
             label="stored trial record",
         )
+        time_bases = {
+            *(entry[0].time_basis for entry in stage_entries),
+            *(entry[0].time_basis for entry in attestation_entries),
+            *(entry[0].time_basis for entry in cleanup_entries),
+        }
+        if len(time_bases) != 1:
+            raise FinancialSupportBundleError(
+                "stage, attestation, and cleanup artifacts must use one time basis"
+            )
+        self.time_basis = next(iter(time_bases))
+        if self.time_basis != "simulated":
+            raise FinancialSupportBundleError(
+                "this one-shot repository admits only explicitly simulated runs"
+            )
         self.trial_records = tuple(
             entry[0].record
             for entry in sorted(
@@ -784,10 +930,26 @@ class FinancialSupportBundleRepository:
             ) from error
 
     def _validate_cross_references(self) -> None:
+        planned_by_key = {trial.key: trial for trial in self.compiled_experiment.planned_trials}
+        cells_by_key = {cell.key: cell.selector for cell in self.compiled_experiment.cells}
+        if {record.trial_key for record in self.trial_records} != set(planned_by_key):
+            raise FinancialSupportBundleError(
+                "trial records do not exactly cover the bundled compiler plan"
+            )
         used_stage_digests: set[str] = set()
         used_attestations: set[str] = set()
         used_cleanups: set[str] = set()
         for record in self.trial_records:
+            planned = planned_by_key[record.trial_key]
+            if (
+                record.spec_digest != self.compiled_experiment.spec_digest
+                or record.cell_key != planned.cell_key
+                or record.block != planned.block
+                or record.replicate != planned.replicate
+            ):
+                raise FinancialSupportBundleError(
+                    f"trial {record.trial_key} disagrees with the bundled compiler plan"
+                )
             attestation_entry = self._attestations.get(record.trial_key)
             if attestation_entry is None:
                 raise FinancialSupportBundleError(
@@ -802,6 +964,20 @@ class FinancialSupportBundleRepository:
                 raise FinancialSupportBundleError(
                     f"trial {record.trial_key} disagrees with its raw attestation"
                 )
+            scope = self.compiled_experiment.contract.scope
+            if (
+                attestation.ordinal != planned.ordinal
+                or attestation.observed_selector != cells_by_key[planned.cell_key]
+                or attestation.observed_build_digest != scope.build_digest
+                or attestation.observed_dataset_digest != self.dataset_digest
+                or attestation.observed_fixture_digest != self.fixture_digest
+                or attestation.base_snapshot_digest != self.dataset_digest
+                or record.clone.base_snapshot_digest != self.dataset_digest
+                or attestation.time_basis != self.time_basis
+            ):
+                raise FinancialSupportBundleError(
+                    f"trial {record.trial_key} has inconsistent scope or provenance"
+                )
             used_attestations.add(record.trial_key)
 
             for event in _executed_trace_events(record.trace):
@@ -815,6 +991,10 @@ class FinancialSupportBundleRepository:
                     raise FinancialSupportBundleError(
                         f"event {event.event_id} disagrees with its stage artifact"
                     )
+                if artifact.time_basis != self.time_basis:
+                    raise FinancialSupportBundleError(
+                        f"event {event.event_id} uses a different time basis"
+                    )
                 used_stage_digests.add(digest)
 
             cleanup_entry = self._cleanups_by_digest.get(record.cleanup.evidence_bundle_digest)
@@ -826,6 +1006,10 @@ class FinancialSupportBundleRepository:
             if not _cleanup_matches_record(cleanup, cleanup_digest, record):
                 raise FinancialSupportBundleError(
                     f"trial {record.trial_key} disagrees with its cleanup artifact"
+                )
+            if cleanup.time_basis != self.time_basis:
+                raise FinancialSupportBundleError(
+                    f"trial {record.trial_key} cleanup uses a different time basis"
                 )
             used_cleanups.add(cleanup_digest)
 
