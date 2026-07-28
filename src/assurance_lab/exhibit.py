@@ -35,6 +35,7 @@ from assurance_lab.evaluation import (
 )
 from assurance_lab.evidence.canonical import canonical_json_bytes
 from assurance_lab.scenarios.financial_support_e2e import (
+    FinancialSupportActionArtifact,
     FinancialSupportBundleRepository,
     FinancialSupportStageArtifact,
 )
@@ -42,6 +43,10 @@ from assurance_lab.scenarios.financial_support_e2e import (
 Digest = Annotated[str, Field(pattern=DIGEST_PATTERN)]
 BundleId = Annotated[str, Field(pattern=r"^cab:sha256:[a-f0-9]{64}$")]
 ClaimRole = Literal["target", "guard", "path", "benign"]
+SyntheticCustomerId = Annotated[
+    str,
+    Field(pattern=r"^SYNTH-CUSTOMER-[0-9]{6}$"),
+]
 
 
 class BaseModel(PydanticBaseModel):
@@ -74,6 +79,39 @@ class CurrentCaseObservation(BaseModel):
     selected_records: int = Field(ge=0)
     guard_blocked: bool
     delivered_records: int = Field(ge=0)
+
+
+class CurrentRequestSummary(BaseModel):
+    action: Literal["out-of-case-bulk-export", "assigned-case-summary"]
+    action_digest: Digest
+    principal_id: Literal["support-017"]
+    role: Literal["support"]
+    data_class: Literal["customer_confidential"]
+    requested_customer_ids: tuple[SyntheticCustomerId, ...] = Field(min_length=1)
+    requested_customer_count: int = Field(ge=1)
+    records_per_customer: Literal[1]
+
+    @model_validator(mode="after")
+    def exact_synthetic_count_and_digest(self) -> CurrentRequestSummary:
+        if self.requested_customer_count != len(self.requested_customer_ids):
+            raise ValueError("request count differs from the derived synthetic ids")
+        if len(set(self.requested_customer_ids)) != len(self.requested_customer_ids):
+            raise ValueError("current request summary contains duplicate customer ids")
+        action_descriptor = {
+            "schema": "assurance-lab.support-action/v1",
+            "principal_id": self.principal_id,
+            "role": self.role,
+            "data_class": self.data_class,
+            "action": self.action,
+            "requested_customer_ids": list(self.requested_customer_ids),
+            "records_per_customer": self.records_per_customer,
+        }
+        derived_digest = (
+            "sha256:" + hashlib.sha256(canonical_json_bytes(action_descriptor)).hexdigest()
+        )
+        if self.action_digest != derived_digest:
+            raise ValueError("current request summary differs from its action digest")
+        return self
 
 
 class GuardState(StrEnum):
@@ -116,8 +154,8 @@ class MaskingInvariant(BaseModel):
 
 
 class FinancialSupportCaseResult(BaseModel):
-    schema_name: Literal["assurance-lab.financial-support-case-result/v1"] = (
-        "assurance-lab.financial-support-case-result/v1"
+    schema_name: Literal["assurance-lab.financial-support-case-result/v2"] = (
+        "assurance-lab.financial-support-case-result/v2"
     )
     bundle_id: BundleId
     profile: Literal["integrity-only"]
@@ -125,6 +163,7 @@ class FinancialSupportCaseResult(BaseModel):
     limitations: tuple[CaseLimitation, ...] = Field(min_length=1)
     evaluation: EvaluationReport
     comparison: BaselineComparison
+    current_request: CurrentRequestSummary
     current: CurrentCaseObservation
     steady_attack_matrix: tuple[AttackMatrixCell, ...] = Field(
         min_length=4,
@@ -161,6 +200,18 @@ class FinancialSupportCaseResult(BaseModel):
         if len(set(benign_keys)) != len(benign_keys):
             raise ValueError("benign outcome trials must be unique")
         profile = self.evaluation.compiled_experiment.contract.profile
+        current_input = self.evaluation.compiled_experiment.current_selector.input
+        if current_input == profile.input.attack:
+            expected_action_digest = profile.input.attack_action_digest
+        elif current_input == profile.input.benign:
+            expected_action_digest = profile.input.benign_action_digest
+        else:
+            raise ValueError("current selector has no compiler-owned input action")
+        if (
+            self.current_request.action_digest != expected_action_digest
+            or self.current_request.action != _string_level(current_input, "current input")
+        ):
+            raise ValueError("current request disagrees with the compiler-owned action")
         current_target = _string_level(profile.target.current, "current target")
         current_compensator = _string_level(
             profile.compensator.current,
@@ -233,6 +284,7 @@ def recompute_case(bundle_root: Path) -> FinancialSupportCaseResult:
         observations,
         report,
     )
+    current_request = _current_request(repository)
     current = _current_observation(repository)
     attack_matrix = _steady_attack_matrix(repository)
     primary_claims = _primary_claims(report)
@@ -254,6 +306,7 @@ def recompute_case(bundle_root: Path) -> FinancialSupportCaseResult:
         limitations=limitations,
         evaluation=report,
         comparison=comparison,
+        current_request=current_request,
         current=current,
         steady_attack_matrix=attack_matrix,
         primary_claims=primary_claims,
@@ -377,6 +430,41 @@ def _current_observation(
             outcome,
             "out_of_scope_records_delivered",
         ),
+    )
+
+
+def _current_request(
+    repository: FinancialSupportBundleRepository,
+) -> CurrentRequestSummary:
+    compiled = repository.compiled_experiment
+    profile = compiled.contract.profile
+    current_input = compiled.current_selector.input
+    action: FinancialSupportActionArtifact
+    if current_input == profile.input.attack:
+        action = repository.attack_action
+        expected_digest = profile.input.attack_action_digest
+    elif current_input == profile.input.benign:
+        action = repository.benign_action
+        expected_digest = profile.input.benign_action_digest
+    else:
+        raise ValueError("bundled current selector has no declared input action")
+    derived_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_json_bytes(action.model_dump(mode="json", by_alias=True))
+        ).hexdigest()
+    )
+    if derived_digest != expected_digest:
+        raise ValueError("bundled current action does not match the compiler digest")
+    return CurrentRequestSummary(
+        action=action.action,
+        action_digest=derived_digest,
+        principal_id=action.principal_id,
+        role=action.role,
+        data_class=action.data_class,
+        requested_customer_ids=action.requested_customer_ids,
+        requested_customer_count=len(action.requested_customer_ids),
+        records_per_customer=action.records_per_customer,
     )
 
 

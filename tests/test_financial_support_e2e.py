@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -40,8 +41,12 @@ from assurance_lab.evidence.writer import (
 from assurance_lab.scenarios import financial_support
 from assurance_lab.scenarios.financial_data import DatasetProfile, generate_dataset
 from assurance_lab.scenarios.financial_support_contract import (
+    ATTACK,
+    ATTACK_ACTION_DIGEST,
     BENIGN,
+    BENIGN_ACTION_DIGEST,
     SCENARIO_ID,
+    action_descriptor,
     build_financial_support_contract,
 )
 from assurance_lab.scenarios.financial_support_e2e import (
@@ -187,6 +192,34 @@ def test_sqlite_runner_round_trips_raw_bundle_evidence_into_masked_inference(
     assert repository.compiled_experiment.planned_trials == compiled.planned_trials
     assert repository.dataset_digest == compiled.contract.scope.dataset_digest
     assert repository.fixture_digest == compiled.contract.scope.fixture_digest
+    assert repository.attack_action.model_dump(
+        mode="json",
+        by_alias=True,
+    ) == action_descriptor(ATTACK)
+    assert repository.benign_action.model_dump(
+        mode="json",
+        by_alias=True,
+    ) == action_descriptor(BENIGN)
+    independently_derived_attack_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_json_bytes(repository.attack_action.model_dump(mode="json", by_alias=True))
+        ).hexdigest()
+    )
+    independently_derived_benign_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_json_bytes(repository.benign_action.model_dump(mode="json", by_alias=True))
+        ).hexdigest()
+    )
+    assert independently_derived_attack_digest == (
+        compiled.contract.profile.input.attack_action_digest
+    )
+    assert independently_derived_attack_digest == ATTACK_ACTION_DIGEST
+    assert independently_derived_benign_digest == (
+        compiled.contract.profile.input.benign_action_digest
+    )
+    assert independently_derived_benign_digest == BENIGN_ACTION_DIGEST
     report = ExperimentEvaluator().evaluate(
         repository.compiled_experiment,
         repository.trial_records,
@@ -287,6 +320,27 @@ def test_sqlite_runner_round_trips_raw_bundle_evidence_into_masked_inference(
         match="does not match the bundled contract scope",
     ):
         FinancialSupportBundleRepository(dataset_replay_root)
+
+    action_fixture_value = strict_json_loads(fixture_path.read_bytes())
+    assert isinstance(action_fixture_value, dict)
+    attack_action = action_fixture_value["attack_action"]
+    assert isinstance(attack_action, dict)
+    requested_customer_ids = attack_action["requested_customer_ids"]
+    assert isinstance(requested_customer_ids, list)
+    requested_customer_ids[0] = "SYNTH-CUSTOMER-000031"
+    action_replay_root = tmp_path / "action-replay"
+    _rewrite_bundle(
+        bundle_root,
+        action_replay_root,
+        replacements={
+            "spec/fixture-manifest.json": canonical_json_bytes(action_fixture_value),
+        },
+    )
+    with pytest.raises(
+        FinancialSupportBundleError,
+        match="actions or digests do not match",
+    ):
+        FinancialSupportBundleRepository(action_replay_root)
 
     stage_path = bundle_root / "records" / "stage-events.jsonl"
     stage_values = strict_jsonl_loads(

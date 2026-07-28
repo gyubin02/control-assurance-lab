@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Hashable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,9 +70,12 @@ from assurance_lab.evidence.writer import (
 )
 from assurance_lab.scenarios.financial_data import SyntheticDataset
 from assurance_lab.scenarios.financial_support_contract import (
+    ATTACK,
     ATTACK_ACTION_DIGEST,
+    BENIGN,
     BENIGN_ACTION_DIGEST,
     SCENARIO_ID,
+    action_descriptor,
 )
 from assurance_lab.scenarios.financial_support_runtime import (
     FinancialSupportRuntime,
@@ -95,6 +99,7 @@ _BUILD_DESCRIPTOR = {
     "implementation": "assurance_lab.scenarios.financial_support_runtime",
     "database": "sqlite-memory",
 }
+_SYNTHETIC_CUSTOMER_ID = re.compile(r"^SYNTH-CUSTOMER-[0-9]{6}$")
 
 
 def _sha256(content: bytes) -> str:
@@ -148,20 +153,51 @@ class _DatasetManifestArtifact(_ArtifactModel):
     logical_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class FinancialSupportActionArtifact(_ArtifactModel):
+    schema_id: Literal["assurance-lab.support-action/v1"] = Field(alias="schema")
+    principal_id: Literal["support-017"]
+    role: Literal["support"]
+    data_class: Literal["customer_confidential"]
+    action: Literal["out-of-case-bulk-export", "assigned-case-summary"]
+    requested_customer_ids: tuple[str, ...] = Field(min_length=1)
+    records_per_customer: Literal[1]
+
+    @model_validator(mode="after")
+    def synthetic_unique_customers(self) -> FinancialSupportActionArtifact:
+        if len(set(self.requested_customer_ids)) != len(self.requested_customer_ids):
+            raise ValueError("requested synthetic customer ids must be unique")
+        if any(
+            _SYNTHETIC_CUSTOMER_ID.fullmatch(customer_id) is None
+            for customer_id in self.requested_customer_ids
+        ):
+            raise ValueError("action contains a non-synthetic customer id")
+        return self
+
+
 class _FixtureManifestArtifact(_ArtifactModel):
-    schema_id: Literal["assurance-lab.financial-support-fixture/v1"] = Field(alias="schema")
+    schema_id: Literal["assurance-lab.financial-support-fixture/v2"] = Field(alias="schema")
     dataset: _DatasetManifestArtifact
     bulk_threshold_records: Literal[10]
+    attack_action: FinancialSupportActionArtifact
+    benign_action: FinancialSupportActionArtifact
     attack_action_digest: Digest
     benign_action_digest: Digest
 
     @model_validator(mode="after")
     def fixed_actions(self) -> _FixtureManifestArtifact:
         if (
-            self.attack_action_digest != ATTACK_ACTION_DIGEST
+            self.attack_action.action != ATTACK.value
+            or self.benign_action.action != BENIGN.value
+            or len(self.attack_action.requested_customer_ids) != 10
+            or len(self.benign_action.requested_customer_ids) != 1
+            or _digest_value(self.attack_action.model_dump(mode="json", by_alias=True))
+            != self.attack_action_digest
+            or _digest_value(self.benign_action.model_dump(mode="json", by_alias=True))
+            != self.benign_action_digest
+            or self.attack_action_digest != ATTACK_ACTION_DIGEST
             or self.benign_action_digest != BENIGN_ACTION_DIGEST
         ):
-            raise ValueError("fixture manifest action digests do not match the scenario")
+            raise ValueError("fixture manifest actions or digests do not match the scenario")
         return self
 
 
@@ -330,9 +366,11 @@ class FinancialSupportExperimentRunner:
         self.build_digest = FINANCIAL_SUPPORT_RUNTIME_BUILD_DIGEST
         self.dataset_digest = f"sha256:{self._dataset_manifest['logical_digest']}"
         self._fixture_manifest = {
-            "schema": "assurance-lab.financial-support-fixture/v1",
+            "schema": "assurance-lab.financial-support-fixture/v2",
             "dataset": self._dataset_manifest,
             "bulk_threshold_records": bulk_threshold_records,
+            "attack_action": action_descriptor(ATTACK),
+            "benign_action": action_descriptor(BENIGN),
             "attack_action_digest": ATTACK_ACTION_DIGEST,
             "benign_action_digest": BENIGN_ACTION_DIGEST,
         }
@@ -785,6 +823,16 @@ class FinancialSupportBundleRepository:
             raise FinancialSupportBundleError(
                 "fixture manifest embeds a different dataset manifest"
             )
+        input_profile = compiled.contract.profile.input
+        if (
+            fixture_manifest.attack_action_digest != input_profile.attack_action_digest
+            or fixture_manifest.benign_action_digest != input_profile.benign_action_digest
+        ):
+            raise FinancialSupportBundleError(
+                "fixture actions do not match the compiler-owned input digests"
+            )
+        self.attack_action = fixture_manifest.attack_action
+        self.benign_action = fixture_manifest.benign_action
         self.dataset_digest = f"sha256:{dataset_manifest.logical_digest}"
         self.fixture_digest = _sha256(fixture_bytes)
         if (

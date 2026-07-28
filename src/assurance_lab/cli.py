@@ -116,19 +116,28 @@ def _run(destination: Path) -> FinancialSupportCaseResult:
 
 def _print_human(result: FinancialSupportCaseResult) -> None:
     benign_safe = sum(item.assigned_records_delivered == 1 for item in result.benign_outcomes)
-    blocked = (
-        f"{result.current.selected_records} blocked"
-        if result.current.guard_blocked
-        else "not blocked"
-    )
+    claims = {item.role: item.truth.value.upper() for item in result.primary_claims}
+    guard_value = "release blocked" if result.current.guard_blocked else "release allowed"
     print("Nothing left the system. The first control still failed.")
     print()
-    print(f"{result.current.selected_records:>2} selected at entitlement boundary    REFUTED")
-    print(f"{blocked:>2} at release guard          SUPPORTED")
-    print(f"{result.current.delivered_records:>2} delivered outside boundary         SUPPORTED")
     print(
-        f" 1 assigned record in {benign_safe}/{len(result.benign_outcomes)} "
-        "benign runs     SUPPORTED"
+        f"Request               {result.current_request.action} · "
+        f"{result.current_request.principal_id} · "
+        f"{result.current_request.requested_customer_count} customers x "
+        f"{result.current_request.records_per_customer} record"
+    )
+    print(
+        f"Entitlement boundary  {result.current.selected_records} "
+        f"out-of-scope records selected    {claims['target']}"
+    )
+    print(f"Release guard         {guard_value:<31}{claims['guard']}")
+    print(
+        f"Outside boundary      {result.current.delivered_records} "
+        f"out-of-scope records delivered   {claims['path']}"
+    )
+    print(
+        f"Benign service        1 assigned record · "
+        f"{benign_safe}/{len(result.benign_outcomes)} runs         {claims['benign']}"
     )
     print()
     print(f"Final-outcome-only   {result.comparison.baseline.verdict.value.upper()}")

@@ -1,0 +1,1 @@
+{"counts":{"accounts":4000,"customers":2000,"principals":22,"support_cases":200,"transactions":50000},"generator_version":"financial-support-data/v1","logical_digest":"67a283e7b816ed4f70c4e88393f13d37a5c7655c5c930cc20c342cf7b5057933","profile":"default","schema":"assurance.synthetic-dataset/v1","seed":2907}

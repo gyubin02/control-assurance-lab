@@ -14,11 +14,14 @@ from assurance_lab.evidence.canonical import (
 )
 from assurance_lab.exhibit import (
     CaseLimitation,
+    CurrentRequestSummary,
     FinancialSupportCaseResult,
     GuardState,
     recompute_case,
 )
 from assurance_lab.scenarios.financial_support_contract import (
+    ATTACK,
+    ATTACK_ACTION_DIGEST,
     COMPENSATOR_OFF,
     COMPENSATOR_ON,
     TARGET_EFFECTIVE,
@@ -35,9 +38,13 @@ def test_cli_run_then_verify_recomputes_one_bundle_derived_case(
     assert main(["run", str(bundle_root)]) == 0
     run_output = capsys.readouterr().out
     assert "Nothing left the system. The first control still failed." in run_output
-    assert "10 selected at entitlement boundary    REFUTED" in run_output
-    assert "10 blocked at release guard          SUPPORTED" in run_output
-    assert " 0 delivered outside boundary         SUPPORTED" in run_output
+    assert (
+        "Request               out-of-case-bulk-export · support-017 · 10 customers x 1 record"
+    ) in run_output
+    assert "Entitlement boundary  10 out-of-scope records selected    REFUTED" in run_output
+    assert "Release guard         release blocked" in run_output
+    assert "Outside boundary      0 out-of-scope records delivered   SUPPORTED" in run_output
+    assert "Benign service        1 assigned record · 8/8 runs" in run_output
     assert "Control-specific     MASKED TARGET FAILURE" in run_output
 
     result = recompute_case(bundle_root)
@@ -50,6 +57,25 @@ def test_cli_run_then_verify_recomputes_one_bundle_derived_case(
     assert result.current.selected_records == 10
     assert result.current.guard_blocked
     assert result.current.delivered_records == 0
+    assert result.current_request.action == ATTACK.value
+    assert result.current_request.action_digest == ATTACK_ACTION_DIGEST
+    assert result.current_request.principal_id == "support-017"
+    assert result.current_request.role == "support"
+    assert result.current_request.data_class == "customer_confidential"
+    assert result.current_request.requested_customer_count == 10
+    assert result.current_request.records_per_customer == 1
+    assert result.current_request.requested_customer_ids == tuple(
+        f"SYNTH-CUSTOMER-{index:06d}" for index in range(21, 31)
+    )
+    tampered_request = result.current_request.model_dump()
+    requested_customer_ids = list(tampered_request["requested_customer_ids"])
+    requested_customer_ids[0] = "SYNTH-CUSTOMER-000031"
+    tampered_request["requested_customer_ids"] = tuple(requested_customer_ids)
+    with pytest.raises(
+        ValueError,
+        match="current request summary differs from its action digest",
+    ):
+        CurrentRequestSummary.model_validate(tampered_request, strict=True)
     assert len(result.benign_outcomes) == 8
     assert {observation.assigned_records_delivered for observation in result.benign_outcomes} == {1}
     assert result.profile == "integrity-only"
@@ -124,3 +150,11 @@ def test_cli_run_then_verify_recomputes_one_bundle_derived_case(
         strict=True,
     )
     assert from_cli == result
+
+
+def test_checked_in_case_view_is_exactly_recomputed_from_the_example_bundle() -> None:
+    repository_root = Path(__file__).parents[1]
+    result = recompute_case(repository_root / "examples" / "masked-export.cab")
+    checked_in = (repository_root / "web" / "case.json").read_bytes()
+
+    assert canonical_json_bytes(result.model_dump(mode="json")) == checked_in
