@@ -1,7 +1,8 @@
 # Experimental semantics
 
 Status: design draft. Terms and thresholds may change after the first two scenario
-implementations.
+implementations. The dated notes and decision records are part of the design record;
+this file describes the current model.
 
 ## 1. Objects
 
@@ -83,7 +84,7 @@ Examples:
 
 Active defeaters are never hidden by a numeric score.
 
-## 2. Four separate effectiveness questions
+## 2. Questions that must stay separate
 
 | Dimension | Question | Typical evidence |
 |---|---|---|
@@ -95,6 +96,16 @@ Active defeaters are never hidden by a numeric score.
 A control can be well designed but not operating. It can be operating while its
 evidence pipeline is broken. The business impact can be prevented while the target
 control fails.
+
+The evaluator therefore has three result families rather than one experiment-wide
+pass:
+
+- protocol validity: whether the declared experiment was actually run;
+- contrast result: what changed between matched interventions; and
+- point claim result: what the evidence says about one scoped state.
+
+A successful `broken -> intended` contrast describes the tested mechanism. It is not
+evidence that the currently deployed instance is in the intended state.
 
 ## 3. Evaluation state
 
@@ -125,18 +136,23 @@ recorded rationale and owner.
 
 An interventional witness is a set of matched executions, not one log line.
 
-### Minimum deterministic matrix
+### Minimum deterministic design
 
-| Run family | Target control | Input | Expected purpose |
-|---|---|---|---|
-| `attack-baseline` | absent or intentionally broken | fixed malicious action | show the action can reach the protected condition |
-| `attack-treatment` | intended state | same malicious action | measure the target-control contrast |
-| `benign-baseline` | absent or broken | fixed legitimate action | establish normal behavior |
-| `benign-treatment` | intended state | same legitimate action | detect functional regression or total outage |
-| `unrelated-intervention` | unrelated control changed | same malicious action | detect harness or environment sensitivity |
+The core preventive design crosses input and target-control state.
 
-Plausible control mutations add stronger tests. Repeated runs and randomized or
-alternating order are required when any outcome is nondeterministic.
+| Input | Target broken | Target intended |
+|---|---|---|
+| fixed malicious action | expose the protected condition | measure the local control effect |
+| fixed legitimate action | establish normal behavior | detect regression or total outage |
+
+It also performs a sham redeploy: the same lifecycle steps without a semantic control
+change. A sham is narrower than an arbitrary “unrelated control.” It is meant to
+expose restart, cache, ordering, and harness effects.
+
+When a downstream control can hide the target failure, malicious input crosses target
+and compensating-control state as a second 2 x 2. Benign traffic crosses those states
+too when the compensator can break legitimate behavior. Repeated runs and randomized
+or counterbalanced order are required when any outcome is nondeterministic.
 
 ### Required checks
 
@@ -146,12 +162,12 @@ alternating order are required when any outcome is nondeterministic.
 4. **Mechanism observation:** evidence exists at the named enforcement/observation point.
 5. **Attack contrast:** the protected outcome changes in the expected direction.
 6. **Benign invariance:** legitimate behavior remains within its allowed envelope.
-7. **Unrelated invariance:** the unrelated intervention does not explain the contrast.
+7. **Sham invariance:** the deployment lifecycle alone does not explain the contrast.
 8. **Repeatability:** repeated paired results satisfy the declared rule.
 9. **Cleanup:** the environment returns to the declared baseline or is destroyed.
 
-If checks 2 or 3 fail, the system may report an observed difference but must not
-attribute it to the target control.
+If checks 2 or 3 fail, the system may preserve the observations but the contrast is
+invalid. It does not emit a softened “probably attributable” Boolean.
 
 ### Claim strength
 
@@ -211,22 +227,28 @@ predicate `Y`, a paired contrast is:
 delta(e, a) = Y(e, a, t=1) - Y(e, a, t=0)
 ```
 
-Attribution requires more than `delta != 0`:
+The contrast protocol requires more than `delta != 0`:
 
 ```text
-attributable =
-    manipulation_verified
+valid_protocol =
+    complete_declared_design
+    and matched_action_and_seed
+    and verified_reset_lineage
+    and manipulation_verified
     and environment_equivalent
     and mechanism_observed
-    and expected_attack_contrast
-    and benign_invariant
-    and unrelated_invariant
+    and sham_invariant
     and evidence_gate_passed
 ```
 
+The result then records whether the expected attack contrast and benign invariance
+were satisfied, violated, heterogeneous, or unresolved. It does not collapse these
+facts into `attributable=True`.
+
 For stochastic systems, the evaluator estimates a paired treatment effect with a
-declared uncertainty method rather than applying this Boolean shortcut. The first
-benchmark will determine the default repetition count and interval/test.
+declared uncertainty method rather than applying a deterministic relation. The first
+benchmark will determine the default repetition count and interval/test; until then,
+the deterministic evaluator must not claim statistical power.
 
 ## 8. Invariants for the implementation
 
@@ -241,4 +263,3 @@ benchmark will determine the default repetition count and interval/test.
 8. Secret-bearing evidence is rejected or redacted before bundle finalization.
 9. A bundle verifier can recompute every derived verdict from included canonical inputs.
 10. Unsupported framework mappings are omitted rather than guessed.
-
