@@ -70,4 +70,6 @@ The model is described in
 [`docs/experimental-semantics.md`](docs/experimental-semantics.md). The boundary
 against BAS, configuration scanners, OSCAL, and assurance cases is recorded in
 [`research/prior-art.md`](research/prior-art.md). The Korean learning note is
-[`notes/masked-control-case.ko.md`](notes/masked-control-case.ko.md).
+[`notes/masked-control-case.ko.md`](notes/masked-control-case.ko.md). The exact line
+between browser verification and CLI evaluation is documented in
+[`decisions/0004-browser-exhibit-verification.md`](decisions/0004-browser-exhibit-verification.md).
