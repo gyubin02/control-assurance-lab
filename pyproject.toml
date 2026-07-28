@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "control-assurance-lab"
+version = "0.0.1"
+description = "Experimental security-control assurance engine"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Gyubin Lee" },
+]
+dependencies = [
+  "pydantic>=2.12,<3",
+  "PyYAML>=6.0.2,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.130,<7",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/assurance_lab"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["assurance_lab"]
+

@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Generated experiment data. Curated fixtures belong under benchmarks/fixtures.
+runs/
+evidence/
+
+# Local secrets and operator-specific overrides.
+.env
+.env.*
+!.env.example
+local/
