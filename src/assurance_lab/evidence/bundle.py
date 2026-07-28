@@ -556,6 +556,56 @@ def _scan_tree(root_descriptor: int, limits: BundleLimits) -> _Tree:
     return tree
 
 
+def _tree_snapshot_issues(
+    before: _Tree,
+    after: _Tree,
+) -> list[VerificationIssue]:
+    issues = list(after.issues)
+    if not after.complete and not issues:
+        issues.append(
+            _issue(
+                "tree-changed",
+                "final bundle tree scan did not complete",
+            )
+        )
+
+    for kind, before_entries, after_entries in (
+        ("file", before.files, after.files),
+        ("directory", before.directories, after.directories),
+    ):
+        before_paths = set(before_entries)
+        after_paths = set(after_entries)
+        for path in sorted(before_paths - after_paths):
+            issues.append(
+                _issue(
+                    "tree-changed",
+                    f"{kind} disappeared after payload verification",
+                    path,
+                )
+            )
+        for path in sorted(after_paths - before_paths):
+            issues.append(
+                _issue(
+                    "tree-changed",
+                    f"{kind} appeared after payload verification",
+                    path,
+                )
+            )
+        for path in sorted(before_paths & after_paths):
+            if not _stable_file(
+                before_entries[path].stat,
+                after_entries[path].stat,
+            ):
+                issues.append(
+                    _issue(
+                        "entry-changed",
+                        f"{kind} changed after payload verification",
+                        path,
+                    )
+                )
+    return issues
+
+
 def _open_scanned_file(
     root_descriptor: int,
     entry: _Entry,
@@ -638,6 +688,53 @@ def _hash_payload(
     return digest.hexdigest(), size, bytes(content) if content is not None else None
 
 
+def _final_payload_issues(
+    root_descriptor: int,
+    manifest: BundleManifest,
+    tree: _Tree,
+    limits: BundleLimits,
+) -> list[VerificationIssue]:
+    issues: list[VerificationIssue] = []
+    for descriptor in manifest.files:
+        entry = tree.files.get(descriptor.path)
+        if entry is None:
+            continue
+        try:
+            digest, size, _ = _hash_payload(
+                root_descriptor,
+                entry,
+                tree.directories,
+                capture=False,
+                limits=limits,
+            )
+        except OSError as error:
+            issues.append(
+                _issue(
+                    "unreadable-payload",
+                    f"payload changed during final verification: {error}",
+                    descriptor.path,
+                )
+            )
+            continue
+        if size != descriptor.size:
+            issues.append(
+                _issue(
+                    "size-mismatch",
+                    f"manifest={descriptor.size}; final={size}",
+                    descriptor.path,
+                )
+            )
+        if digest != descriptor.sha256:
+            issues.append(
+                _issue(
+                    "digest-mismatch",
+                    f"manifest={descriptor.sha256}; final={digest}",
+                    descriptor.path,
+                )
+            )
+    return issues
+
+
 def _canonical_artifact_issue(
     descriptor: BundleFile,
     content: bytes,
@@ -668,7 +765,12 @@ def verify_bundle(
     *,
     limits: BundleLimits | None = None,
 ) -> BundleVerification:
-    """Verify directory safety, canonical representation, size, and SHA-256 integrity."""
+    """Verify the directory snapshot observed during this call.
+
+    The result does not make the pathname immutable.  A caller that permits
+    concurrent writers must consume a pinned snapshot or reverify before
+    reopening payloads.
+    """
 
     if limits is None:
         limits = BundleLimits()
@@ -863,6 +965,37 @@ def verify_bundle(
                 if artifact_issue is not None:
                     issues.append(artifact_issue)
 
+        if not issues:
+            final_tree = _scan_tree(root_descriptor, limits)
+            issues.extend(_tree_snapshot_issues(tree, final_tree))
+            if not issues:
+                issues.extend(
+                    _final_payload_issues(
+                        root_descriptor,
+                        manifest,
+                        final_tree,
+                        limits,
+                    )
+                )
+                final_manifest, final_manifest_stat, final_manifest_issue = (
+                    _read_root_manifest(root_descriptor, limits)
+                )
+                if (
+                    final_manifest_issue is not None
+                    or final_manifest is None
+                    or final_manifest_stat is None
+                    or final_manifest != raw_manifest
+                    or not _stable_file(manifest_stat, final_manifest_stat)
+                ):
+                    issues.append(
+                        _issue(
+                            "root-manifest-changed",
+                            "bundle.json changed after payload verification",
+                            "bundle.json",
+                        )
+                    )
+                closing_tree = _scan_tree(root_descriptor, limits)
+                issues.extend(_tree_snapshot_issues(final_tree, closing_tree))
         if not _stable_file(opened_root, os.fstat(root_descriptor)):
             issues.append(
                 _issue(

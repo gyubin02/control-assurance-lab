@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from assurance_lab.evidence import writer as writer_module
 from assurance_lab.evidence.bundle import (
     BundleStatus,
     EvaluationRef,
     EvaluatorRef,
     ExperimentRef,
     Sensitivity,
+    verify_bundle,
 )
 from assurance_lab.evidence.canonical import canonical_json_bytes, canonical_jsonl_bytes
 from assurance_lab.evidence.writer import (
@@ -119,4 +122,66 @@ def test_writer_removes_a_bundle_that_fails_canonical_verification(
             metadata=_metadata(),
             payloads=invalid,
         )
+    assert not destination.exists()
+
+
+def test_writer_rejects_destination_root_swap_to_foreign_valid_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "evidence"
+    displaced = tmp_path / "displaced"
+    foreign = tmp_path / "foreign"
+    foreign_result = write_bundle(
+        foreign,
+        metadata=_metadata(),
+        payloads=_payloads(),
+    )
+    real_verify = writer_module.verify_bundle
+
+    def swap_then_verify(path: Path):
+        path.rename(displaced)
+        foreign.rename(path)
+        return real_verify(path)
+
+    monkeypatch.setattr(writer_module, "verify_bundle", swap_then_verify)
+
+    with pytest.raises(BundleWriteError, match="destination root changed"):
+        write_bundle(
+            destination,
+            metadata=_metadata(),
+            payloads=_payloads(),
+        )
+
+    assert verify_bundle(destination).bundle_id == foreign_result.bundle_id
+    assert verify_bundle(displaced).status == BundleStatus.INTEGRITY_VERIFIED
+
+
+def test_writer_requires_the_exact_manifest_and_bundle_id_it_constructed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign = tmp_path / "foreign"
+    foreign_result = write_bundle(
+        foreign,
+        metadata=replace(
+            _metadata(),
+            parent_bundles=(f"cab:sha256:{'f' * 64}",),
+        ),
+        payloads=_payloads(),
+    )
+    monkeypatch.setattr(
+        writer_module,
+        "verify_bundle",
+        lambda _path: foreign_result,
+    )
+    destination = tmp_path / "evidence"
+
+    with pytest.raises(BundleWriteError, match="different manifest or bundle id"):
+        write_bundle(
+            destination,
+            metadata=_metadata(),
+            payloads=_payloads(),
+        )
+
     assert not destination.exists()

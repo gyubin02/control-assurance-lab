@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from assurance_lab.evidence import bundle as bundle_module
 from assurance_lab.evidence.bundle import (
     PROFILE,
     ROOT_MEDIA_TYPE,
@@ -383,3 +384,36 @@ def test_manifest_size_is_checked_before_read(tmp_path: Path) -> None:
 
     assert result.status == BundleStatus.CORRUPT
     assert result.issues[0].code == "resource-limit"
+
+
+def test_same_inode_payload_overwrite_after_hash_is_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = b'{"id":"event:1","value":"safe"}\n'
+    replacement = b'{"id":"event:1","value":"evil"}\n'
+    assert len(original) == len(replacement)
+    _write_bundle(tmp_path, original)
+    target = tmp_path / "records/events.jsonl"
+    before = target.stat()
+    real_hash_payload = bundle_module._hash_payload
+    overwritten = False
+
+    def overwrite_after_hash(*args, **kwargs):
+        nonlocal overwritten
+        result = real_hash_payload(*args, **kwargs)
+        if not overwritten:
+            target.write_bytes(replacement)
+            overwritten = True
+        return result
+
+    monkeypatch.setattr(bundle_module, "_hash_payload", overwrite_after_hash)
+
+    result = bundle_module.verify_bundle(tmp_path)
+
+    assert target.stat().st_ino == before.st_ino
+    assert result.status == BundleStatus.CORRUPT
+    assert {
+        "entry-changed",
+        "digest-mismatch",
+    } & {issue.code for issue in result.issues}
