@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="A control-specific reading of one synthetic customer-data export experiment."
+    >
+    <title>Control Assurance — Case Note 01</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main id="case-view" class="page" aria-busy="true">
+      <header class="masthead">
+        <a class="wordmark" href="#finding" aria-label="Control Assurance case note">
+          <span>Control Assurance</span>
+          <span>Case note 01</span>
+        </a>
+        <div class="masthead-status">
+          <p class="masthead-meta" id="case-meta">Loading case evidence…</p>
+          <p
+            class="integrity-status"
+            id="integrity-status"
+            role="status"
+            aria-live="polite"
+          >Checking bundle integrity…</p>
+        </div>
+      </header>
+
+      <div id="load-error" class="load-error" role="alert" hidden>
+        <p>The case evidence could not be opened.</p>
+        <p class="load-error-detail" id="load-error-detail"></p>
+      </div>
+
+      <article id="finding" hidden>
+        <header class="hero">
+          <p class="eyebrow" id="case-eyebrow"></p>
+          <h1 id="case-headline"></h1>
+          <div class="hero-foot">
+            <p class="hero-dek" id="case-dek"></p>
+            <div class="finding-mark" aria-label="Control-specific finding">
+              <span>Finding</span>
+              <strong id="case-classification"></strong>
+            </div>
+          </div>
+        </header>
+
+        <section class="section pipeline-section" aria-labelledby="pipeline-title">
+          <div class="section-intro">
+            <p class="section-index">01</p>
+            <div>
+              <h2 id="pipeline-title">What actually happened</h2>
+              <p id="pipeline-caption"></p>
+            </div>
+          </div>
+          <ol class="pipeline" id="pipeline" aria-label="Observed request path"></ol>
+        </section>
+
+        <section class="section reading-section" aria-labelledby="reading-title">
+          <div class="section-intro">
+            <p class="section-index">02</p>
+            <div>
+              <h2 id="reading-title">One run, two conclusions</h2>
+              <p>The difference is not the data. It is where the question stops.</p>
+            </div>
+          </div>
+          <div class="readings">
+            <article class="reading reading-baseline">
+              <p class="reading-kicker" id="baseline-kicker"></p>
+              <h3 id="baseline-title"></h3>
+              <p class="reading-verdict" id="baseline-verdict"></p>
+              <p class="reading-reason" id="baseline-reason"></p>
+            </article>
+            <article class="reading reading-specific">
+              <p class="reading-kicker" id="specific-kicker"></p>
+              <h3 id="specific-title"></h3>
+              <p class="reading-verdict" id="specific-verdict"></p>
+              <p class="reading-reason" id="specific-reason"></p>
+            </article>
+          </div>
+        </section>
+
+        <section class="section causality-section" aria-labelledby="causality-title">
+          <div class="section-intro">
+            <p class="section-index">03</p>
+            <div>
+              <h2 id="causality-title">Why that conclusion holds</h2>
+              <p id="matrix-caption"></p>
+            </div>
+          </div>
+          <div class="causality-layout">
+            <div class="matrix-wrap">
+              <table class="matrix" id="attack-matrix">
+                <caption class="visually-hidden">Attack-path intervention matrix</caption>
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+              <p class="matrix-note" id="matrix-note"></p>
+            </div>
+            <aside class="benign-check" aria-labelledby="benign-title">
+              <p class="reading-kicker">Service check</p>
+              <h3 id="benign-title"></h3>
+              <div class="benign-series" id="benign-series" aria-hidden="true"></div>
+              <p class="benign-result" id="benign-result"></p>
+              <p class="benign-detail" id="benign-detail"></p>
+            </aside>
+          </div>
+        </section>
+
+        <section class="evidence-section" aria-labelledby="evidence-title">
+          <details class="evidence" id="evidence">
+            <summary>
+              <span>
+                <span class="section-index">04</span>
+                <span class="evidence-summary-copy">
+                  <strong id="evidence-title">Trace the finding to raw evidence</strong>
+                  <span>The browser verified the bundle before showing this finding.</span>
+                </span>
+              </span>
+              <span class="disclosure-label" aria-hidden="true">
+                <span class="when-closed">Open</span>
+                <span class="when-open">Close</span>
+              </span>
+            </summary>
+            <div class="evidence-body">
+              <p class="evidence-boundary" id="evidence-boundary"></p>
+              <dl class="evidence-meta" id="evidence-meta"></dl>
+              <div class="evidence-chain">
+                <div class="evidence-chain-head" aria-hidden="true">
+                  <span>Observation</span>
+                  <span>Raw value</span>
+                  <span>Artifact digest</span>
+                </div>
+                <ol id="evidence-artifacts"></ol>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <footer class="limitation">
+          <p class="section-index">Scope</p>
+          <div>
+            <p class="limitation-intro">Declared by the case result:</p>
+            <ul class="limitation-list" id="limitations"></ul>
+          </div>
+        </footer>
+      </article>
+    </main>
+  </body>
+</html>
