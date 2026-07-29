@@ -46,3 +46,18 @@ jobs:
           node verifier-js/src/cli.js examples/masked-export.cab
           node --check web/app.js
           node --test web/app.test.js
+
+      - name: Build and smoke-test release archives
+        run: |
+          python -m hatchling build --target wheel --target sdist --directory dist
+          python scripts/check-distributions.py dist
+          python -m venv /tmp/control-assurance-wheel
+          /tmp/control-assurance-wheel/bin/python -m pip install \
+            --only-binary=:all: --require-hashes -r requirements/ci.lock
+          /tmp/control-assurance-wheel/bin/python -m pip install --no-deps dist/*.whl
+          (
+            cd /tmp
+            /tmp/control-assurance-wheel/bin/assurance-lab --version
+            /tmp/control-assurance-wheel/bin/assurance-lab verify \
+              "$GITHUB_WORKSPACE/examples/masked-export.cab"
+          )
