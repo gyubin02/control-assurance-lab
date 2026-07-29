@@ -18,8 +18,9 @@ response   2 inputs × 2 named-control states × 2 fallback states × 2 sham sta
 recovery   2 inputs × 2 named-control states × 2 fallback states × 2 sham states
 ```
 
-That is 48 cells. Every cell starts from a fresh synthetic fixture. These are not 48
-consecutive actions against one incident.
+That is 48 distinct cells. The benchmark plan runs three fresh-clone replicates per
+cell, for 144 planned executions. These are not 144 consecutive actions against one
+incident.
 
 The earlier preventive case remains the incident source and a worked example of the
 same non-masking rule. It is not counted again in the 48-cell lifecycle result.
@@ -78,20 +79,28 @@ changed file with internally updated hashes tests semantic verification.
 | C03 | duplicate a trial key or fresh-clone identity | reject trial lineage |
 | C04 | relabel a selector while preserving its observations | reject selector binding |
 | C05 | swap the fixed attack and benign action digests | reject action binding |
-| C06 | reuse a trace or event artifact across post-fork runs | reject provenance |
+| C06 | reuse a trace or event artifact across two trials in the same benchmark bundle | reject provenance |
 | C07 | move required evidence outside its freshness window | return no positive verdict |
 | C08 | introduce a source sequence gap in a closed detection window | do not conclude absence |
 | C09 | omit collector completion or clock-bound evidence | do not conclude absence |
 | C10 | replace the named target's subject with a different session, rule, or snapshot | reject subject binding |
 | C11 | present fallback evidence as the named control's local readback | keep the named control unsupported |
-| C12 | remove or fail cleanup for a reused environment | invalidate dependent runs |
+| C12 | remove or fail cleanup for a fresh-clone trial | reject that trial; v1 makes no descendant-run claim |
 | C13 | add contradictory target-local observations | return `CONFLICTING` |
 | C14 | remove or rewrite an admitted disclosure entry | reject lifecycle |
 | C15 | select a matched-comparison snapshot as current | reject lifecycle |
 | C16 | reuse the compromised session as its replacement | reject lifecycle |
+| C17 | change evaluator identity, evaluation time, parent bundle, or file roles and rebuild the manifest | reject provenance |
+| C18 | rewrite a derived stage value and every dependent digest without changing its lower-level database or query receipt | reject semantic reconstruction |
+| C19 | claim that fallback telemetry was forwarded while disconnecting the forwarded read-back from the alert input | reject causal path binding |
+| C20 | label a run as reload/reapply while omitting the persisted pre/post operation receipt | reject sham attestation |
 
 The released corruption generator must be deterministic and must record whether it
 rebuilt the manifest.
+
+Fresh-clone identities remain unique, but benchmark generation injects a deterministic
+nonce source so that two releases from the frozen inputs are byte-identical. Production
+or ad-hoc runtime defaults may still use operating-system randomness.
 
 ## Measures
 
@@ -123,6 +132,10 @@ recompute:
 - the named-control, fallback, path, and benign results;
 - the shallow baseline result; and
 - the residual classification.
+
+The recovery bundle therefore vendors the lifecycle parent manifest and every payload
+needed to verify the cutover and disclosure ledger. An absolute path or a parent bundle
+ID by itself is not portable evidence.
 
 Agreement means semantic equality of these outputs, not byte-for-byte equality of
 two programs' internal objects.

@@ -73,3 +73,9 @@ against BAS, configuration scanners, OSCAL, and assurance cases is recorded in
 [`notes/masked-control-case.ko.md`](notes/masked-control-case.ko.md). The exact line
 between browser verification and CLI evaluation is documented in
 [`decisions/0004-browser-exhibit-verification.md`](decisions/0004-browser-exhibit-verification.md).
+Why recovery holds session cutover fixed is recorded in
+[`decisions/0006-recovery-does-not-retest-the-session-cutover.md`](decisions/0006-recovery-does-not-retest-the-session-cutover.md).
+Why an empty alert query is not yet negative evidence is recorded in
+[`decisions/0007-no-alert-is-not-yet-an-observation.md`](decisions/0007-no-alert-is-not-yet-an-observation.md).
+Why principal quarantine cannot stand in for exact-session revocation is recorded in
+[`decisions/0008-quarantine-is-not-session-revocation.md`](decisions/0008-quarantine-is-not-session-revocation.md).
