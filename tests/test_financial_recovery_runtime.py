@@ -37,17 +37,11 @@ from assurance_lab.evidence.bundle import (
     Sensitivity,
     verify_bundle,
 )
+from assurance_lab.evidence.canonical import canonical_json_bytes
 from assurance_lab.lifecycle import (
-    BranchKind,
-    CompromisedSessionState,
     ConfidentialityStatus,
-    DisclosureEntry,
     DisclosureLedger,
     IncidentSnapshot,
-    LifecyclePhase,
-    QuarantineState,
-    ReplacementSessionState,
-    VerifiedLifecycle,
     incident_snapshot_digest,
 )
 from assurance_lab.scenarios.financial_data import DatasetProfile, generate_dataset
@@ -61,11 +55,10 @@ from assurance_lab.scenarios.financial_recovery_contract import (
     ATTACK_ACTION_DIGEST,
     BENIGN,
     BENIGN_ACTION_DIGEST,
+    COMPARISON_REPLACEMENT_SESSION_ID,
     COMPENSATOR_OFF,
     COMPENSATOR_ON,
-    OLD_SESSION_DIGEST,
     OLD_SESSION_ID,
-    REPLACEMENT_SESSION_DIGEST,
     REPLACEMENT_SESSION_ID,
     SCENARIO_ID,
     SHAM_REAPPLY,
@@ -80,6 +73,10 @@ from assurance_lab.scenarios.financial_recovery_contract import (
     entitlement_set_descriptor,
     snapshot_descriptor,
 )
+from assurance_lab.scenarios.financial_recovery_e2e import (
+    build_reference_recovery_lifecycle,
+    write_reference_recovery_lifecycle_bundle,
+)
 from assurance_lab.scenarios.financial_recovery_runtime import (
     FinancialRecoveryRuntime,
     FinancialRecoveryRuntimeResult,
@@ -91,6 +88,7 @@ from assurance_lab.scenarios.financial_recovery_runtime import (
     RuntimeEvent,
     assess_recovery_case,
     lifecycle_cutover_bundle_payloads,
+    lifecycle_proof_bundle_payloads,
 )
 
 _BUNDLE_ROOTS: list[tempfile.TemporaryDirectory[str]] = []
@@ -149,139 +147,21 @@ def _bundle(fill: str) -> str:
     return f"cab:sha256:{fill * 64}"
 
 
-def _cutover_snapshot(*, target_effective: bool) -> IncidentSnapshot:
-    observed_at = datetime(2026, 7, 29, 0, 30, tzinfo=UTC)
-    entitlement_digest = (
-        APPROVED_ENTITLEMENT_SET_DIGEST
-        if target_effective
-        else STALE_ENTITLEMENT_SET_DIGEST
-    )
-    branch_kind = (
-        BranchKind.MATCHED_COMPARISON
-        if target_effective
-        else BranchKind.ACTUAL
-    )
-    branch_id = (
-        "recovery-approved-comparison"
-        if target_effective
-        else "recovery-stale-actual"
-    )
-    return IncidentSnapshot(
-        incident_id="INC-SYNTH-RECOVERY-0001",
-        branch_id=branch_id,
-        branch_kind=branch_kind,
-        ordinal=5,
-        phase=LifecyclePhase.SESSION_ROTATED,
-        source_prevention_bundle_id=_bundle("1"),
-        source_trial_key=_digest("2"),
-        source_trace_id="synthetic-prevention-source",
-        principal_id="support-017",
-        entitlement_set_digest=entitlement_digest,
-        compromised_session_digest=OLD_SESSION_DIGEST,
-        compromised_session_state=CompromisedSessionState.REVOKED,
-        quarantine_state=QuarantineState.NORMAL,
-        replacement_session_digest=REPLACEMENT_SESSION_DIGEST,
-        replacement_session_state=ReplacementSessionState.ACTIVE,
-        replacement_entitlement_digest=entitlement_digest,
-        confidentiality_status=ConfidentialityStatus.PRIOR_DISCLOSURE_OCCURRED,
-        disclosure_ledger=DisclosureLedger(
-            entries=(
-                DisclosureEntry(
-                    record_token="SYNTH-DISCLOSED-RECORD-0001",
-                    first_delivery_trace_id="synthetic-prior-delivery",
-                    first_delivery_event_digest=_digest("3"),
-                    first_observed_at=observed_at - timedelta(minutes=10),
-                ),
-                DisclosureEntry(
-                    record_token="SYNTH-DISCLOSED-RECORD-0002",
-                    first_delivery_trace_id="synthetic-prior-delivery",
-                    first_delivery_event_digest=_digest("4"),
-                    first_observed_at=observed_at - timedelta(minutes=10),
-                ),
-            )
-        ),
-        observed_at=observed_at,
-        previous_snapshot_digest=_digest("5"),
-        evidence_ids=(),
-    )
-
-
 def _cutover_fixtures() -> dict[str, LifecycleCutoverFixture]:
-    actual = _cutover_snapshot(target_effective=False)
-    comparison = _cutover_snapshot(target_effective=True)
-    actual_transition = _digest("6")
-    comparison_transition = _digest("7")
-    verified = VerifiedLifecycle(
-        incident_id=actual.incident_id,
-        current_snapshot_digest=incident_snapshot_digest(actual),
-        actual_head_digest=incident_snapshot_digest(actual),
-        matched_comparison_head_digest=incident_snapshot_digest(comparison),
-        actual_transition_ids=(actual_transition,),
-        matched_comparison_transition_ids=(comparison_transition,),
-    )
-    payloads: dict[str, bytes] = {}
-    for (
-        target_level,
-        transition_id,
-        target_snapshot_digest,
-        snapshot,
-    ) in (
-        (
-            TARGET_INEFFECTIVE.value,
-            actual_transition,
-            STALE_SNAPSHOT_DIGEST,
-            actual,
-        ),
-        (
-            TARGET_EFFECTIVE.value,
-            comparison_transition,
-            APPROVED_SNAPSHOT_DIGEST,
-            comparison,
-        ),
-    ):
-        payloads.update(
-            lifecycle_cutover_bundle_payloads(
-                target_level=target_level,
-                session_rotation_transition_id=transition_id,
-                target_snapshot_digest=target_snapshot_digest,
-                old_session_id=OLD_SESSION_ID,
-                replacement_session_id=REPLACEMENT_SESSION_ID,
-                snapshot=snapshot,
-                verified_lifecycle=verified,
-            )
-        )
-    verification, bundle_root = _verified_lifecycle_bundle(payloads)
-    assert verification.bundle_id is not None
-    return {
-        TARGET_INEFFECTIVE.value: LifecycleCutoverFixture(
-            lifecycle_bundle_digest=verification.bundle_id,
-            lifecycle_bundle_root=bundle_root,
-            bundle_verification=verification,
-            session_rotation_transition_id=actual_transition,
-            target_snapshot_digest=STALE_SNAPSHOT_DIGEST,
-            old_session_id=OLD_SESSION_ID,
-            replacement_session_id=REPLACEMENT_SESSION_ID,
-            snapshot=actual,
-            verified_lifecycle=verified,
-        ),
-        TARGET_EFFECTIVE.value: LifecycleCutoverFixture(
-            lifecycle_bundle_digest=verification.bundle_id,
-            lifecycle_bundle_root=bundle_root,
-            bundle_verification=verification,
-            session_rotation_transition_id=comparison_transition,
-            target_snapshot_digest=APPROVED_SNAPSHOT_DIGEST,
-            old_session_id=OLD_SESSION_ID,
-            replacement_session_id=REPLACEMENT_SESSION_ID,
-            snapshot=comparison,
-            verified_lifecycle=verified,
-        ),
-    }
+    owner = tempfile.TemporaryDirectory(prefix="assurance-recovery-cab-")
+    _BUNDLE_ROOTS.append(owner)
+    evidence = write_reference_recovery_lifecycle_bundle(Path(owner.name) / "lifecycle.cab")
+    return evidence.cutover_fixtures()
 
 
 def _verified_lifecycle_bundle(
     payloads: dict[str, bytes],
 ) -> tuple[BundleVerification, Path]:
     def role(path: str) -> str:
+        if path.endswith("/incident-lifecycle.json"):
+            return "lifecycle-verifier-input"
+        if path.endswith("/admitted-receipts.json"):
+            return "lifecycle-admitted-receipts"
         if path.endswith("/verified-lifecycle.json"):
             return "lifecycle-verifier-output"
         if path.endswith("/cutover-snapshot.json"):
@@ -461,7 +341,8 @@ def test_fixed_actions_and_snapshots_have_distinct_canonical_identities() -> Non
     assert ATTACK_ACTION_DIGEST != BENIGN_ACTION_DIGEST
     assert STALE_SNAPSHOT_DIGEST != APPROVED_SNAPSHOT_DIGEST
     assert STALE_ENTITLEMENT_SET_DIGEST != APPROVED_ENTITLEMENT_SET_DIGEST
-    assert attack["session_id"] == REPLACEMENT_SESSION_ID
+    assert attack["session_role"] == "active-replacement"
+    assert "session_id" not in attack
     assert attack["requested_customer_ids"] == [
         f"SYNTH-CUSTOMER-{index:06d}" for index in range(21, 31)
     ]
@@ -776,10 +657,13 @@ def test_cutover_fixture_is_fixed_and_bound_to_each_selected_snapshot(
         trace_id="approved-cutover",
     )
 
-    for result in (stale, approved):
+    for result, expected_replacement in (
+        (stale, REPLACEMENT_SESSION_ID),
+        (approved, COMPARISON_REPLACEMENT_SESSION_ID),
+    ):
         assert result.old_session_id == OLD_SESSION_ID
         assert result.old_session_state == RecoverySessionState.REVOKED
-        assert result.replacement_session_id == REPLACEMENT_SESSION_ID
+        assert result.replacement_session_id == expected_replacement
         assert result.replacement_session_state == RecoverySessionState.ACTIVE
         assert result.replacement_session_entitlement_digest_bound
         assert (
@@ -848,7 +732,13 @@ def test_events_bind_snapshot_cutover_selection_release_and_history(
 
     assert input_event.value("action_digest") == ATTACK_ACTION_DIGEST
     assert input_event.value("principal_id") == "support-017"
-    assert input_event.value("session_id") == REPLACEMENT_SESSION_ID
+    assert input_event.value("session_role") == "active-replacement"
+    assert input_event.value("resolved_session_id") == REPLACEMENT_SESSION_ID
+    assert input_event.value("session_resolution_digest") == result.session_resolution_digest
+    assert (
+        input_event.value("session_resolution_lifecycle_snapshot_digest")
+        == result.lifecycle_snapshot_digest
+    )
     assert str(input_event.value("requested_customer_ids_digest")).startswith(
         "sha256:"
     )
@@ -1389,7 +1279,10 @@ def test_joint_lifecycle_and_ledger_rehash_cannot_keep_the_old_cab_identity(
     rebound_benign = rewrite(benign)
     assert rebound_attack.lifecycle_bundle_digest == original_bundle_id
 
-    with pytest.raises(ValueError, match="lifecycle CAB"):
+    with pytest.raises(
+        ValueError,
+        match=r"lifecycle CAB|session-role resolution",
+    ):
         assess_recovery_case(rebound_attack, rebound_benign)
 
 
@@ -1977,7 +1870,10 @@ def test_rebound_snapshot_and_lifecycle_cannot_reuse_old_verification(
         verified_lifecycle=rebound_verified,
     )
 
-    with pytest.raises(ValueError, match="descriptor is rebound"):
+    with pytest.raises(
+        ValueError,
+        match=r"descriptor is rebound|differs from independent replay",
+    ):
         FinancialRecoveryRuntime(
             generate_dataset(seed=2907, profile=DatasetProfile.DEFAULT),
             cutover_fixtures=fixtures,
@@ -2097,30 +1993,31 @@ def test_target_contrast_requires_one_shared_lifecycle_cab() -> None:
     )
 
     split: dict[str, LifecycleCutoverFixture] = {}
+    lifecycle, receipts, verified = build_reference_recovery_lifecycle()
+    proof_payloads = lifecycle_proof_bundle_payloads(
+        lifecycle=lifecycle,
+        admitted_receipts=receipts,
+        verified_lifecycle=verified,
+    )
     for target_level in (
         TARGET_INEFFECTIVE.value,
         TARGET_EFFECTIVE.value,
     ):
         source = shared[target_level]
-        verified = source.verified_lifecycle
-        if target_level == TARGET_EFFECTIVE.value:
-            verified = verified.model_copy(
-                update={
-                    "current_snapshot_digest": _digest("e"),
-                    "actual_head_digest": _digest("e"),
-                }
-            )
-        payloads = lifecycle_cutover_bundle_payloads(
-            target_level=target_level,
-            session_rotation_transition_id=(
-                source.session_rotation_transition_id
+        payloads = {
+            **proof_payloads,
+            **lifecycle_cutover_bundle_payloads(
+                target_level=target_level,
+                session_rotation_transition_id=(
+                    source.session_rotation_transition_id
+                ),
+                target_snapshot_digest=source.target_snapshot_digest,
+                old_session_id=source.old_session_id,
+                replacement_session_id=source.replacement_session_id,
+                snapshot=source.snapshot,
+                verified_lifecycle=verified,
             ),
-            target_snapshot_digest=source.target_snapshot_digest,
-            old_session_id=source.old_session_id,
-            replacement_session_id=source.replacement_session_id,
-            snapshot=source.snapshot,
-            verified_lifecycle=verified,
-        )
+        }
         verification, root = _verified_lifecycle_bundle(payloads)
         assert verification.bundle_id is not None
         split[target_level] = replace(
@@ -2135,6 +2032,108 @@ def test_target_contrast_requires_one_shared_lifecycle_cab() -> None:
         FinancialRecoveryRuntime(
             generate_dataset(seed=2907, profile=DatasetProfile.DEFAULT),
             cutover_fixtures=split,
+        )
+
+
+def test_cutover_transition_must_be_the_rotation_edge_that_created_the_snapshot() -> None:
+    fixtures = _cutover_fixtures()
+    lifecycle, receipts, verified = build_reference_recovery_lifecycle()
+    payloads = lifecycle_proof_bundle_payloads(
+        lifecycle=lifecycle,
+        admitted_receipts=receipts,
+        verified_lifecycle=verified,
+    )
+    wrong_transition_ids: dict[str, str] = {}
+    for target_level, branch in (
+        (TARGET_INEFFECTIVE.value, lifecycle.actual),
+        (TARGET_EFFECTIVE.value, lifecycle.matched_comparison),
+    ):
+        source = fixtures[target_level]
+        wrong_transition_id = branch.transitions[0].transition_id
+        assert wrong_transition_id != branch.transitions[-1].transition_id
+        wrong_transition_ids[target_level] = wrong_transition_id
+        payloads.update(
+            lifecycle_cutover_bundle_payloads(
+                target_level=target_level,
+                session_rotation_transition_id=wrong_transition_id,
+                target_snapshot_digest=source.target_snapshot_digest,
+                old_session_id=source.old_session_id,
+                replacement_session_id=source.replacement_session_id,
+                snapshot=source.snapshot,
+                verified_lifecycle=verified,
+            )
+        )
+
+    verification, root = _verified_lifecycle_bundle(payloads)
+    assert verification.bundle_id is not None
+    for target_level, fixture in tuple(fixtures.items()):
+        fixtures[target_level] = replace(
+            fixture,
+            lifecycle_bundle_digest=verification.bundle_id,
+            lifecycle_bundle_root=root,
+            bundle_verification=verification,
+            session_rotation_transition_id=wrong_transition_ids[target_level],
+            verified_lifecycle=verified,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="session rotation transition does not produce",
+    ):
+        FinancialRecoveryRuntime(
+            generate_dataset(seed=2907, profile=DatasetProfile.DEFAULT),
+            cutover_fixtures=fixtures,
+        )
+
+
+def test_integrity_valid_bundle_cannot_self_assert_a_lifecycle_verdict() -> None:
+    """Raw lifecycle inputs, not a producer-authored verdict, decide admission."""
+
+    fixtures = _cutover_fixtures()
+    source = fixtures[TARGET_INEFFECTIVE.value]
+    lifecycle, receipts, verified = build_reference_recovery_lifecycle()
+    raw_lifecycle = lifecycle.model_dump(mode="json")
+    comparison_head = raw_lifecycle["matched_comparison"]["snapshots"][-1]
+    comparison_head["replacement_session_digest"] = (
+        raw_lifecycle["actual"]["snapshots"][-1]["replacement_session_digest"]
+    )
+
+    proof_payloads = lifecycle_proof_bundle_payloads(
+        lifecycle=lifecycle,
+        admitted_receipts=receipts,
+        verified_lifecycle=verified,
+    )
+    proof_payloads["records/lifecycle/incident-lifecycle.json"] = (
+        canonical_json_bytes(raw_lifecycle)
+    )
+    payloads = {
+        **proof_payloads,
+        **lifecycle_cutover_bundle_payloads(
+            target_level=TARGET_INEFFECTIVE.value,
+            session_rotation_transition_id=source.session_rotation_transition_id,
+            target_snapshot_digest=source.target_snapshot_digest,
+            old_session_id=source.old_session_id,
+            replacement_session_id=source.replacement_session_id,
+            snapshot=source.snapshot,
+            verified_lifecycle=source.verified_lifecycle,
+        ),
+    }
+    verification, root = _verified_lifecycle_bundle(payloads)
+    assert verification.bundle_id is not None
+    fixtures[TARGET_INEFFECTIVE.value] = replace(
+        source,
+        lifecycle_bundle_digest=verification.bundle_id,
+        lifecycle_bundle_root=root,
+        bundle_verification=verification,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="raw proof does not reproduce a valid lifecycle",
+    ):
+        FinancialRecoveryRuntime(
+            generate_dataset(seed=2907, profile=DatasetProfile.DEFAULT),
+            cutover_fixtures=fixtures,
         )
 
 

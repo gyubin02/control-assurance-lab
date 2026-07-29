@@ -8,10 +8,11 @@ is responsible for proving the transition that produced this state.
 
 The caller's trusted boundary is the result returned by the CAB verifier for a
 lifecycle evidence bundle.  This runtime checks that manifest's content address
-and the exact payload descriptors for the lifecycle snapshot, verifier output,
-and cutover reference before materializing them in the clone.  It does not
-re-run the lifecycle state-machine proof or authenticate who produced the
-bundle.
+and the exact payload descriptors for the raw lifecycle, admitted receipts,
+verifier output, lifecycle snapshot, and cutover reference.  It then re-runs
+the lifecycle state-machine proof from those canonical inputs before
+materializing the cutover in the clone.  This still does not authenticate who
+produced the bundle; origin authentication belongs to evidence admission.
 
 The prior-disclosure ledger is materialized as immutable canonical entries and
 read back before and after the retest.  Operational recovery is never treated
@@ -22,9 +23,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -41,18 +44,23 @@ from assurance_lab.evidence.bundle import (
     Sensitivity,
     verify_bundle,
 )
-from assurance_lab.evidence.canonical import canonical_json_bytes
+from assurance_lab.evidence.canonical import canonical_json_bytes, strict_json_loads
 from assurance_lab.lifecycle import (
+    AdmittedReceiptEvidence,
     BranchKind,
     CompromisedSessionState,
+    IncidentLifecycle,
     IncidentSnapshot,
+    LifecycleAction,
     LifecyclePhase,
     ReplacementSessionState,
     VerifiedLifecycle,
     incident_snapshot_digest,
+    verify_lifecycle,
 )
 from assurance_lab.scenarios.financial_data import SyntheticDataset
 from assurance_lab.scenarios.financial_recovery_contract import (
+    ACTIVE_REPLACEMENT_SESSION_ROLE,
     APPROVED_CASE_ID,
     APPROVED_CUSTOMER_ID,
     APPROVED_ENTITLEMENT_SET_DIGEST,
@@ -63,6 +71,8 @@ from assurance_lab.scenarios.financial_recovery_contract import (
     ATTACK_ACTION_DIGEST,
     BENIGN,
     BENIGN_ACTION_DIGEST,
+    COMPARISON_REPLACEMENT_SESSION_DIGEST,
+    COMPARISON_REPLACEMENT_SESSION_ID,
     COMPENSATOR_OFF,
     COMPENSATOR_ON,
     OLD_SESSION_DIGEST,
@@ -89,10 +99,28 @@ _TRACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CLONE_NONCE = re.compile(r"^[a-f0-9]{32}$")
 _DIGEST = re.compile(DIGEST_PATTERN)
 _BUNDLE_ID = re.compile(r"^cab:sha256:[a-f0-9]{64}$")
+_LIFECYCLE_INPUT_PATH = "records/lifecycle/incident-lifecycle.json"
+_LIFECYCLE_ADMITTED_RECEIPTS_PATH = (
+    "records/lifecycle/admitted-receipts.json"
+)
 _LIFECYCLE_VERIFIER_OUTPUT_PATH = (
     "records/lifecycle/verified-lifecycle.json"
 )
 _LIFECYCLE_BUNDLE_REQUIRED_FOR = "financial-recovery-cutover"
+_MAX_LIFECYCLE_PAYLOAD_BYTES = 1024 * 1024
+_MAX_LIFECYCLE_ADMITTED_RECEIPTS = 256
+_READ_CHUNK_BYTES = 64 * 1024
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_FILE_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 class RecoverySessionState(StrEnum):
@@ -120,7 +148,7 @@ class RecoveryResidualClassification(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class LifecycleCutoverFixture:
-    """Trusted reference to a lifecycle-owned, already-verified cutover state.
+    """Reference to a lifecycle-owned, already-verified cutover state.
 
     ``bundle_verification`` records the producer's verification result, but it
     is not trusted merely because it has the right Pydantic shape.  The runtime
@@ -129,9 +157,10 @@ class LifecycleCutoverFixture:
     result, and the manifest must bind the full snapshot, lifecycle verifier
     output, and cutover reference.
 
-    This is an integrity boundary, not origin authentication.  The recovery
-    runtime validates and carries the lifecycle verifier's output; it does not
-    re-run the lifecycle state-machine proof.
+    This is an integrity and reproducibility boundary, not origin
+    authentication.  The recovery runtime re-runs the lifecycle verifier from
+    the bundle's raw lifecycle and admitted-receipt inputs, then requires the
+    bundled verifier output and this fixture to equal that result.
     """
 
     lifecycle_bundle_digest: str
@@ -188,6 +217,19 @@ class CloneReadback:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionRoleResolutionReadback:
+    """Persisted binding from the stable action role to one branch session."""
+
+    session_role: str
+    resolved_session_id: str
+    resolved_session_digest: str
+    lifecycle_snapshot_digest: str
+    verified_lifecycle_digest: str
+    canonical: str
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class AssignmentReadback:
     customer_ids: tuple[str, ...]
     canonical: str
@@ -225,6 +267,11 @@ class FinancialRecoveryRuntimeResult:
     guard_level: str
     sham_level: str
     action_digest: str
+    action_session_role: str
+    session_resolution_canonical: str
+    session_resolution_digest: str
+    session_resolution_lifecycle_snapshot_digest: str
+    session_resolution_verified_lifecycle_digest: str
     snapshot_id: str
     snapshot_digest: str
     entitlement_set_canonical: str
@@ -424,6 +471,11 @@ class FinancialRecoveryRuntime:
                 action_digest=action_digest,
                 requested_ids=requested_ids,
             )
+            _resolve_session_role(
+                connection,
+                trace_id=trace_id,
+                session_role=_required_text(action, "session_role"),
+            )
             (
                 action_canonical,
                 action_digest_readback,
@@ -439,12 +491,29 @@ class FinancialRecoveryRuntime:
                 raise RuntimeError("request audit rows do not reproduce the fixed action")
 
             lifecycle_before = _lifecycle_reference_readback(connection)
+            session_resolution = _session_role_resolution_readback(
+                connection,
+                trace_id,
+            )
             if not _lifecycle_reference_matches_fixture(
                 lifecycle_before,
                 fixture,
             ):
                 raise RuntimeError(
                     "persisted lifecycle reference differs from the supplied fixture"
+                )
+            if (
+                session_resolution.session_role != ACTIVE_REPLACEMENT_SESSION_ROLE
+                or session_resolution.resolved_session_id != fixture.replacement_session_id
+                or session_resolution.resolved_session_digest
+                != fixture.snapshot.replacement_session_digest
+                or session_resolution.lifecycle_snapshot_digest
+                != lifecycle_before.lifecycle_snapshot_digest
+                or session_resolution.verified_lifecycle_digest
+                != lifecycle_before.verified_lifecycle_digest
+            ):
+                raise RuntimeError(
+                    "persisted session-role resolution differs from the lifecycle cutover"
                 )
             before_reapply = _snapshot_readback(connection)
             before_reapply_canonical = rfc8785.dumps(before_reapply).decode("utf-8")
@@ -524,7 +593,11 @@ class FinancialRecoveryRuntime:
                 replacement_state,
                 replacement_binding_digest,
                 cutover_lifecycle_snapshot_digest,
-            ) = _cutover_readback(connection)
+            ) = _cutover_readback(
+                connection,
+                old_session_id=fixture.old_session_id,
+                replacement_session_id=session_resolution.resolved_session_id,
+            )
             replacement_binding_valid = (
                 replacement_binding_digest == entitlement_set_digest
             )
@@ -533,7 +606,7 @@ class FinancialRecoveryRuntime:
                 replacement_state == RecoverySessionState.ACTIVE
             )
             cutover_valid = (
-                OLD_SESSION_ID != REPLACEMENT_SESSION_ID
+                fixture.old_session_id != session_resolution.resolved_session_id
                 and old_session_revoked
                 and replacement_session_active
                 and replacement_binding_valid
@@ -686,6 +759,7 @@ class FinancialRecoveryRuntime:
             action=action,
             action_canonical=action_canonical,
             action_digest=action_digest,
+            session_resolution=session_resolution,
             requested_ids=requested_ids_readback,
             lifecycle_before=lifecycle_before,
             lifecycle_after=lifecycle_after,
@@ -729,6 +803,15 @@ class FinancialRecoveryRuntime:
             guard_level=guard_level,
             sham_level=sham_level,
             action_digest=action_digest,
+            action_session_role=session_resolution.session_role,
+            session_resolution_canonical=session_resolution.canonical,
+            session_resolution_digest=session_resolution.digest,
+            session_resolution_lifecycle_snapshot_digest=(
+                session_resolution.lifecycle_snapshot_digest
+            ),
+            session_resolution_verified_lifecycle_digest=(
+                session_resolution.verified_lifecycle_digest
+            ),
             snapshot_id=expected_snapshot_id,
             snapshot_digest=after_reapply_digest,
             entitlement_set_canonical=entitlement_set_canonical,
@@ -775,7 +858,7 @@ class FinancialRecoveryRuntime:
             old_session_id=OLD_SESSION_ID,
             old_session_state=old_state,
             old_session_revoked=old_session_revoked,
-            replacement_session_id=REPLACEMENT_SESSION_ID,
+            replacement_session_id=session_resolution.resolved_session_id,
             replacement_session_state=replacement_state,
             replacement_session_active=replacement_session_active,
             replacement_session_entitlement_set_digest=(
@@ -972,7 +1055,21 @@ class FinancialRecoveryRuntime:
                 action_digest TEXT NOT NULL,
                 request_id TEXT NOT NULL,
                 principal_id TEXT NOT NULL,
-                session_id TEXT NOT NULL
+                session_role TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE session_role_resolutions (
+                trace_id TEXT PRIMARY KEY REFERENCES recovery_requests(trace_id),
+                session_role TEXT NOT NULL,
+                resolved_session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                resolved_session_digest TEXT NOT NULL,
+                lifecycle_snapshot_digest TEXT NOT NULL,
+                verified_lifecycle_digest TEXT NOT NULL,
+                resolution_canonical TEXT NOT NULL,
+                resolution_digest TEXT NOT NULL
             )
             """
         )
@@ -1469,9 +1566,14 @@ def _validate_runtime_result_consistency(
         raise ValueError(
             "recovery result is not the fixed recovery execution for its target"
         )
+    expected_replacement_session_id = (
+        REPLACEMENT_SESSION_ID
+        if target_value == TARGET_INEFFECTIVE
+        else COMPARISON_REPLACEMENT_SESSION_ID
+    )
     if (
         result.old_session_id != OLD_SESSION_ID
-        or result.replacement_session_id != REPLACEMENT_SESSION_ID
+        or result.replacement_session_id != expected_replacement_session_id
     ):
         raise ValueError("recovery result changed the fixed cutover identities")
     if (
@@ -1497,6 +1599,15 @@ def _validate_runtime_result_consistency(
         ) from error
     if incident_snapshot_digest(lifecycle_snapshot) != result.lifecycle_snapshot_digest:
         raise ValueError("recovery result lifecycle snapshot is not content addressed")
+    if (
+        result.action_session_role != ACTIVE_REPLACEMENT_SESSION_ROLE
+        or lifecycle_snapshot.replacement_session_digest
+        != _session_identity_digest(result.replacement_session_id)
+    ):
+        raise ValueError(
+            "recovery result session-role resolution is not bound to its "
+            "lifecycle replacement session"
+        )
     try:
         verified_lifecycle = VerifiedLifecycle.model_validate_json(
             result.verified_lifecycle_canonical,
@@ -1513,6 +1624,27 @@ def _validate_runtime_result_consistency(
         raise ValueError(
             "recovery result verified lifecycle digest is invalid"
         )
+    (
+        expected_resolution_canonical,
+        expected_resolution_digest,
+    ) = _session_resolution_evidence(
+        session_role=result.action_session_role,
+        resolved_session_id=result.replacement_session_id,
+        resolved_session_digest=_session_identity_digest(
+            result.replacement_session_id
+        ),
+        lifecycle_snapshot_digest=result.lifecycle_snapshot_digest,
+        verified_lifecycle_digest=result.verified_lifecycle_digest,
+    )
+    if (
+        result.session_resolution_canonical != expected_resolution_canonical
+        or result.session_resolution_digest != expected_resolution_digest
+        or result.session_resolution_lifecycle_snapshot_digest
+        != result.lifecycle_snapshot_digest
+        or result.session_resolution_verified_lifecycle_digest
+        != result.verified_lifecycle_digest
+    ):
+        raise ValueError("recovery result session-role resolution record is invalid")
     result_fixture = LifecycleCutoverFixture(
         lifecycle_bundle_digest=result.lifecycle_bundle_digest,
         lifecycle_bundle_root=result.lifecycle_bundle_root,
@@ -2079,6 +2211,19 @@ def _validate_runtime_event_receipts(
         action=action,
         action_canonical=rfc8785.dumps(action).decode("utf-8"),
         action_digest=result.action_digest,
+        session_resolution=SessionRoleResolutionReadback(
+            session_role=result.action_session_role,
+            resolved_session_id=result.replacement_session_id,
+            resolved_session_digest=_session_identity_digest(result.replacement_session_id),
+            lifecycle_snapshot_digest=(
+                result.session_resolution_lifecycle_snapshot_digest
+            ),
+            verified_lifecycle_digest=(
+                result.session_resolution_verified_lifecycle_digest
+            ),
+            canonical=result.session_resolution_canonical,
+            digest=result.session_resolution_digest,
+        ),
         requested_ids=result.requested_customer_ids,
         lifecycle_before=lifecycle_before,
         lifecycle_after=lifecycle_after,
@@ -2177,8 +2322,6 @@ def _validate_cutover_fixture(
         raise ValueError("target snapshot digest is not a sha256 digest")
     if fixture.old_session_id != OLD_SESSION_ID:
         raise ValueError("cutover fixture does not bind the fixed old session")
-    if fixture.replacement_session_id != REPLACEMENT_SESSION_ID:
-        raise ValueError("cutover fixture does not bind the fixed replacement session")
 
     snapshot = fixture.snapshot
     target_value = (
@@ -2195,6 +2338,15 @@ def _validate_cutover_fixture(
         if target_value == TARGET_INEFFECTIVE
         else BranchKind.MATCHED_COMPARISON
     )
+    expected_replacement_session_id = (
+        REPLACEMENT_SESSION_ID
+        if expected_branch == BranchKind.ACTUAL
+        else COMPARISON_REPLACEMENT_SESSION_ID
+    )
+    if fixture.replacement_session_id != expected_replacement_session_id:
+        raise ValueError(
+            "cutover fixture does not bind the branch-owned replacement session"
+        )
     expected_entitlement_digest = (
         STALE_ENTITLEMENT_SET_DIGEST
         if target_value == TARGET_INEFFECTIVE
@@ -2266,6 +2418,43 @@ def _validate_cutover_fixture(
     )
 
 
+def lifecycle_proof_bundle_payloads(
+    *,
+    lifecycle: IncidentLifecycle,
+    admitted_receipts: tuple[AdmittedReceiptEvidence, ...],
+    verified_lifecycle: VerifiedLifecycle,
+) -> dict[str, bytes]:
+    """Return canonical verifier inputs and their independently derived output."""
+
+    recomputed = verify_lifecycle(
+        lifecycle,
+        admitted_receipts=admitted_receipts,
+    )
+    if recomputed != verified_lifecycle:
+        raise ValueError(
+            "lifecycle verifier output does not follow from the supplied raw proof"
+        )
+    return {
+        _LIFECYCLE_INPUT_PATH: canonical_json_bytes(
+            lifecycle.model_dump(mode="json")
+        ),
+        _LIFECYCLE_ADMITTED_RECEIPTS_PATH: canonical_json_bytes(
+            {
+                "wire_schema": (
+                    "assurance-lab.lifecycle-admitted-receipts/v1"
+                ),
+                "receipts": [
+                    receipt.model_dump(mode="json")
+                    for receipt in admitted_receipts
+                ],
+            }
+        ),
+        _LIFECYCLE_VERIFIER_OUTPUT_PATH: canonical_json_bytes(
+            recomputed.model_dump(mode="json")
+        ),
+    }
+
+
 def lifecycle_cutover_bundle_payloads(
     *,
     target_level: str,
@@ -2320,9 +2509,6 @@ def lifecycle_cutover_bundle_payloads(
         f"{prefix}/cutover-snapshot.json": canonical_json_bytes(
             snapshot.model_dump(mode="json")
         ),
-        _LIFECYCLE_VERIFIER_OUTPUT_PATH: canonical_json_bytes(
-            verified_lifecycle.model_dump(mode="json")
-        ),
     }
 
 
@@ -2338,6 +2524,19 @@ def _validate_cutover_fixture_bundle_sets(
         raise ValueError(
             "recovery target contrast requires one shared lifecycle CAB"
         )
+
+    replacement_session_ids = {
+        fixture.replacement_session_id for fixture in fixtures.values()
+    }
+    replacement_session_digests = {
+        fixture.snapshot.replacement_session_digest
+        for fixture in fixtures.values()
+    }
+    if (
+        len(replacement_session_ids) != len(fixtures)
+        or len(replacement_session_digests) != len(fixtures)
+    ):
+        raise ValueError("recovery target branches require distinct replacement sessions")
 
     for (root, _bundle_id), members in groups.items():
         verification = verify_bundle(root)
@@ -2364,10 +2563,255 @@ def _validate_cutover_fixture_bundle_sets(
                 )
             )
         observed_paths = {descriptor.path for descriptor in manifest.files}
+        expected_paths.update(
+            {
+                _LIFECYCLE_INPUT_PATH,
+                _LIFECYCLE_ADMITTED_RECEIPTS_PATH,
+                _LIFECYCLE_VERIFIER_OUTPUT_PATH,
+            }
+        )
         if observed_paths != expected_paths:
             raise ValueError(
                 "lifecycle CAB payload set differs from its fixture declarations"
             )
+
+
+def _same_filesystem_object(
+    left: os.stat_result,
+    right: os.stat_result,
+) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        stat.S_IFMT(left.st_mode),
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        stat.S_IFMT(right.st_mode),
+    )
+
+
+def _stable_regular_file(
+    left: os.stat_result,
+    right: os.stat_result,
+) -> bool:
+    return _same_filesystem_object(left, right) and (
+        left.st_size,
+        left.st_nlink,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_size,
+        right.st_nlink,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def _read_pinned_bundle_payload(
+    root_descriptor: int,
+    descriptor: BundleFile,
+) -> bytes:
+    """Read one manifest-owned payload without reopening an unbounded pathname."""
+
+    if descriptor.size > _MAX_LIFECYCLE_PAYLOAD_BYTES:
+        raise ValueError(
+            f"verified lifecycle CAB payload exceeds the recovery limit: "
+            f"{descriptor.path!r}"
+        )
+    components = descriptor.path.split("/")
+    current = os.dup(root_descriptor)
+    payload_descriptor = -1
+    try:
+        for component in components[:-1]:
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=current)
+            os.close(current)
+            current = child
+        listed = os.stat(
+            components[-1],
+            dir_fd=current,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(listed.st_mode)
+            or listed.st_nlink != 1
+            or listed.st_size != descriptor.size
+        ):
+            raise ValueError(
+                f"verified lifecycle CAB payload size or type differs from "
+                f"the manifest: {descriptor.path!r}"
+            )
+        payload_descriptor = os.open(
+            components[-1],
+            _FILE_FLAGS,
+            dir_fd=current,
+        )
+        opened = os.fstat(payload_descriptor)
+        if not _stable_regular_file(listed, opened):
+            raise ValueError(
+                f"verified lifecycle CAB payload changed before open: "
+                f"{descriptor.path!r}"
+            )
+        content = bytearray()
+        while len(content) <= descriptor.size:
+            chunk = os.read(
+                payload_descriptor,
+                min(
+                    _READ_CHUNK_BYTES,
+                    descriptor.size + 1 - len(content),
+                ),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        closing = os.fstat(payload_descriptor)
+        if (
+            len(content) != descriptor.size
+            or not _stable_regular_file(opened, closing)
+        ):
+            raise ValueError(
+                f"verified lifecycle CAB payload changed while read: "
+                f"{descriptor.path!r}"
+            )
+        payload = bytes(content)
+        if hashlib.sha256(payload).hexdigest() != descriptor.sha256:
+            raise ValueError(
+                f"verified lifecycle CAB payload digest differs from "
+                f"the manifest: {descriptor.path!r}"
+            )
+        return payload
+    except OSError as error:
+        raise ValueError(
+            f"verified lifecycle CAB payload cannot be safely read: "
+            f"{descriptor.path!r}"
+        ) from error
+    finally:
+        if payload_descriptor >= 0:
+            os.close(payload_descriptor)
+        os.close(current)
+
+
+def _read_and_verify_lifecycle_proof(
+    root_descriptor: int,
+    descriptors: Mapping[str, BundleFile],
+) -> tuple[
+    IncidentLifecycle,
+    tuple[AdmittedReceiptEvidence, ...],
+    VerifiedLifecycle,
+    dict[str, bytes],
+    dict[str, bytes],
+]:
+    observed: dict[str, bytes] = {}
+    for path in (
+        _LIFECYCLE_INPUT_PATH,
+        _LIFECYCLE_ADMITTED_RECEIPTS_PATH,
+        _LIFECYCLE_VERIFIER_OUTPUT_PATH,
+    ):
+        if path not in descriptors:
+            raise ValueError(
+                f"verified lifecycle CAB is missing proof payload {path!r}"
+            )
+        observed[path] = _read_pinned_bundle_payload(
+            root_descriptor,
+            descriptors[path],
+        )
+
+    try:
+        strict_json_loads(observed[_LIFECYCLE_INPUT_PATH])
+        lifecycle = IncidentLifecycle.model_validate_json(
+            observed[_LIFECYCLE_INPUT_PATH],
+            strict=True,
+        )
+        receipt_document = strict_json_loads(
+            observed[_LIFECYCLE_ADMITTED_RECEIPTS_PATH]
+        )
+        if (
+            type(receipt_document) is not dict
+            or set(receipt_document) != {"wire_schema", "receipts"}
+            or receipt_document["wire_schema"]
+            != "assurance-lab.lifecycle-admitted-receipts/v1"
+            or type(receipt_document["receipts"]) is not list
+        ):
+            raise ValueError(
+                "admitted lifecycle receipts use an unsupported wire shape"
+            )
+        if len(receipt_document["receipts"]) > _MAX_LIFECYCLE_ADMITTED_RECEIPTS:
+            raise ValueError(
+                "admitted lifecycle receipt count exceeds the recovery limit"
+            )
+        receipts = tuple(
+            AdmittedReceiptEvidence.model_validate_json(
+                canonical_json_bytes(raw_receipt),
+                strict=True,
+            )
+            for raw_receipt in receipt_document["receipts"]
+        )
+        expected_payloads = lifecycle_proof_bundle_payloads(
+            lifecycle=lifecycle,
+            admitted_receipts=receipts,
+            verified_lifecycle=verify_lifecycle(
+                lifecycle,
+                admitted_receipts=receipts,
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "lifecycle CAB raw proof does not reproduce a valid lifecycle"
+        ) from error
+
+    for path, expected_payload in expected_payloads.items():
+        descriptor = descriptors[path]
+        _validate_lifecycle_bundle_file(
+            descriptor,
+            payload=expected_payload,
+            expected_role=_lifecycle_payload_role(path),
+        )
+        if observed[path] != expected_payload:
+            raise ValueError(
+                f"lifecycle CAB proof payload is not canonical or reproducible: {path!r}"
+            )
+
+    verified = verify_lifecycle(
+        lifecycle,
+        admitted_receipts=receipts,
+    )
+    return lifecycle, receipts, verified, expected_payloads, observed
+
+
+def _validate_rotation_transition_provenance(
+    lifecycle: IncidentLifecycle,
+    fixture: LifecycleCutoverFixture,
+    *,
+    target_level: str,
+) -> None:
+    branch = (
+        lifecycle.actual
+        if target_level == TARGET_INEFFECTIVE.value
+        else lifecycle.matched_comparison
+        if target_level == TARGET_EFFECTIVE.value
+        else None
+    )
+    if branch is None:
+        raise ValueError(f"unsupported cutover target level: {target_level!r}")
+    matches = tuple(
+        transition
+        for transition in branch.transitions
+        if transition.transition_id == fixture.session_rotation_transition_id
+    )
+    snapshot_digest = incident_snapshot_digest(fixture.snapshot)
+    if (
+        len(matches) != 1
+        or not branch.transitions
+        or matches[0] != branch.transitions[-1]
+        or matches[0].action != LifecycleAction.ROTATE_SESSION
+        or matches[0].to_snapshot_digest != snapshot_digest
+        or matches[0].ordinal + 1 != fixture.snapshot.ordinal
+        or branch.snapshots[-1] != fixture.snapshot
+    ):
+        raise ValueError(
+            "declared session rotation transition does not produce "
+            "the lifecycle cutover snapshot"
+        )
 
 
 def _validate_lifecycle_bundle_reference(
@@ -2376,7 +2820,19 @@ def _validate_lifecycle_bundle_reference(
     target_level: str,
 ) -> None:
     root = fixture.lifecycle_bundle_root
-    if not root.is_absolute() or not root.is_dir():
+    if not root.is_absolute():
+        raise ValueError(
+            "lifecycle bundle root must be an existing absolute directory"
+        )
+    try:
+        listed_root = os.lstat(root)
+    except OSError as error:
+        raise ValueError(
+            "lifecycle bundle root cannot be safely inspected"
+        ) from error
+    if stat.S_ISLNK(listed_root.st_mode) or not stat.S_ISDIR(
+        listed_root.st_mode
+    ):
         raise ValueError(
             "lifecycle bundle root must be an existing absolute directory"
         )
@@ -2404,36 +2860,81 @@ def _validate_lifecycle_bundle_reference(
         )
 
     descriptors = {descriptor.path: descriptor for descriptor in manifest.files}
-    expected_payloads = lifecycle_cutover_bundle_payloads(
-        target_level=target_level,
-        session_rotation_transition_id=fixture.session_rotation_transition_id,
-        target_snapshot_digest=fixture.target_snapshot_digest,
-        old_session_id=fixture.old_session_id,
-        replacement_session_id=fixture.replacement_session_id,
-        snapshot=fixture.snapshot,
-        verified_lifecycle=fixture.verified_lifecycle,
-    )
-    for path, payload in expected_payloads.items():
-        descriptor = descriptors.get(path)
-        if descriptor is None:
+    try:
+        root_descriptor = os.open(root, _DIRECTORY_FLAGS)
+    except OSError as error:
+        raise ValueError("lifecycle bundle root cannot be safely opened") from error
+    try:
+        if not _same_filesystem_object(
+            listed_root,
+            os.fstat(root_descriptor),
+        ):
             raise ValueError(
-                f"verified lifecycle CAB is missing exact payload {path!r}"
+                "lifecycle bundle root changed before payload consumption"
             )
-        _validate_lifecycle_bundle_file(
-            descriptor,
-            payload=payload,
-            expected_role=_lifecycle_payload_role(path),
+        (
+            lifecycle,
+            _admitted_receipts,
+            independently_verified,
+            proof_payloads,
+            observed_payloads,
+        ) = _read_and_verify_lifecycle_proof(
+            root_descriptor,
+            descriptors,
         )
-        try:
-            observed_payload = (root / path).read_bytes()
-        except OSError as error:
+        if independently_verified != fixture.verified_lifecycle:
             raise ValueError(
-                f"verified lifecycle CAB payload cannot be read: {path!r}"
-            ) from error
-        if observed_payload != payload:
-            raise ValueError(
-                f"verified lifecycle CAB payload bytes are rebound: {path!r}"
+                "lifecycle fixture verifier output differs from independent replay"
             )
+        _validate_rotation_transition_provenance(
+            lifecycle,
+            fixture,
+            target_level=target_level,
+        )
+        expected_payloads = {
+            **proof_payloads,
+            **lifecycle_cutover_bundle_payloads(
+                target_level=target_level,
+                session_rotation_transition_id=(
+                    fixture.session_rotation_transition_id
+                ),
+                target_snapshot_digest=fixture.target_snapshot_digest,
+                old_session_id=fixture.old_session_id,
+                replacement_session_id=fixture.replacement_session_id,
+                snapshot=fixture.snapshot,
+                verified_lifecycle=fixture.verified_lifecycle,
+            ),
+        }
+        for path, payload in expected_payloads.items():
+            descriptor = descriptors.get(path)
+            if descriptor is None:
+                raise ValueError(
+                    f"verified lifecycle CAB is missing exact payload {path!r}"
+                )
+            _validate_lifecycle_bundle_file(
+                descriptor,
+                payload=payload,
+                expected_role=_lifecycle_payload_role(path),
+            )
+            observed_payload = observed_payloads.get(path)
+            if observed_payload is None:
+                observed_payload = _read_pinned_bundle_payload(
+                    root_descriptor,
+                    descriptor,
+                )
+            if observed_payload != payload:
+                raise ValueError(
+                    f"verified lifecycle CAB payload bytes are rebound: {path!r}"
+                )
+        if not _same_filesystem_object(
+            listed_root,
+            os.fstat(root_descriptor),
+        ):
+            raise ValueError(
+                "lifecycle bundle root changed while payloads were consumed"
+            )
+    finally:
+        os.close(root_descriptor)
 
     post_read_verification = verify_bundle(root)
     if post_read_verification != verification:
@@ -2460,6 +2961,10 @@ def _validate_lifecycle_bundle_file(
 
 
 def _lifecycle_payload_role(path: str) -> str:
+    if path == _LIFECYCLE_INPUT_PATH:
+        return "lifecycle-verifier-input"
+    if path == _LIFECYCLE_ADMITTED_RECEIPTS_PATH:
+        return "lifecycle-admitted-receipts"
     if path == _LIFECYCLE_VERIFIER_OUTPUT_PATH:
         return "lifecycle-verifier-output"
     if path.endswith("/cutover-snapshot.json"):
@@ -2489,6 +2994,8 @@ def _session_identity_digest(session_id: str) -> str:
         return OLD_SESSION_DIGEST
     if session_id == REPLACEMENT_SESSION_ID:
         return REPLACEMENT_SESSION_DIGEST
+    if session_id == COMPARISON_REPLACEMENT_SESSION_ID:
+        return COMPARISON_REPLACEMENT_SESSION_DIGEST
     raise ValueError("unsupported synthetic recovery session identity")
 
 
@@ -2598,7 +3105,7 @@ def _record_request(
             action_digest,
             _required_text(action, "request_id"),
             _required_text(action, "principal_id"),
-            _required_text(action, "session_id"),
+            _required_text(action, "session_role"),
         ),
     )
     connection.executemany(
@@ -2617,7 +3124,8 @@ def _request_readback(
 ) -> tuple[str, str, tuple[str, ...]]:
     row = connection.execute(
         """
-        SELECT action_canonical, action_digest, request_id, principal_id, session_id
+        SELECT action_canonical, action_digest, request_id, principal_id,
+               session_role
         FROM recovery_requests
         WHERE trace_id = ?
         """,
@@ -2630,7 +3138,7 @@ def _request_readback(
         action_digest_raw,
         request_id_raw,
         principal_id_raw,
-        session_id_raw,
+        session_role_raw,
     ) = row
     action_canonical = str(action_canonical_raw)
     try:
@@ -2654,11 +3162,156 @@ def _request_readback(
     if (
         action.get("request_id") != str(request_id_raw)
         or action.get("principal_id") != str(principal_id_raw)
-        or action.get("session_id") != str(session_id_raw)
+        or action.get("session_role") != str(session_role_raw)
         or action.get("requested_customer_ids") != list(requested)
     ):
         raise RuntimeError("recovery request columns disagree with its canonical action")
     return action_canonical, str(action_digest_raw), requested
+
+
+def _session_resolution_evidence(
+    *,
+    session_role: str,
+    resolved_session_id: str,
+    resolved_session_digest: str,
+    lifecycle_snapshot_digest: str,
+    verified_lifecycle_digest: str,
+) -> tuple[str, str]:
+    canonical = rfc8785.dumps(
+        {
+            "schema": "assurance-lab.session-role-resolution/v1",
+            "session_role": session_role,
+            "resolved_session_id": resolved_session_id,
+            "resolved_session_digest": resolved_session_digest,
+            "lifecycle_snapshot_digest": lifecycle_snapshot_digest,
+            "verified_lifecycle_digest": verified_lifecycle_digest,
+        }
+    ).decode("utf-8")
+    return canonical, _sha256(canonical.encode("utf-8"))
+
+
+def _resolve_session_role(
+    connection: sqlite3.Connection,
+    *,
+    trace_id: str,
+    session_role: str,
+) -> None:
+    if session_role != ACTIVE_REPLACEMENT_SESSION_ROLE:
+        raise RuntimeError("recovery action uses an unsupported session role")
+    rows = connection.execute(
+        """
+        SELECT session_id, session_identity_digest, lifecycle_snapshot_digest
+        FROM sessions
+        WHERE state = 'active' AND entitlement_set_digest IS NOT NULL
+        ORDER BY session_id
+        """
+    ).fetchall()
+    if len(rows) != 1:
+        raise RuntimeError("active-replacement role must resolve to exactly one session")
+    resolved_session_id, resolved_session_digest, lifecycle_snapshot_digest = (
+        str(value) for value in rows[0]
+    )
+    lifecycle_row = connection.execute(
+        """
+        SELECT lifecycle_snapshot_digest, verified_lifecycle_digest
+        FROM lifecycle_cutover_reference
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    if lifecycle_row is None:
+        raise RuntimeError("lifecycle cutover reference is missing")
+    reference_snapshot_digest = str(lifecycle_row[0])
+    verified_lifecycle_digest = str(lifecycle_row[1])
+    if lifecycle_snapshot_digest != reference_snapshot_digest:
+        raise RuntimeError("resolved session does not share the lifecycle cutover provenance")
+    canonical, resolution_digest = _session_resolution_evidence(
+        session_role=session_role,
+        resolved_session_id=resolved_session_id,
+        resolved_session_digest=resolved_session_digest,
+        lifecycle_snapshot_digest=lifecycle_snapshot_digest,
+        verified_lifecycle_digest=verified_lifecycle_digest,
+    )
+    connection.execute(
+        """
+        INSERT INTO session_role_resolutions
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_id,
+            session_role,
+            resolved_session_id,
+            resolved_session_digest,
+            lifecycle_snapshot_digest,
+            verified_lifecycle_digest,
+            canonical,
+            resolution_digest,
+        ),
+    )
+    connection.commit()
+
+
+def _session_role_resolution_readback(
+    connection: sqlite3.Connection,
+    trace_id: str,
+) -> SessionRoleResolutionReadback:
+    rows = connection.execute(
+        """
+        SELECT session_role, resolved_session_id, resolved_session_digest,
+               lifecycle_snapshot_digest, verified_lifecycle_digest,
+               resolution_canonical, resolution_digest
+        FROM session_role_resolutions
+        WHERE trace_id = ?
+        """,
+        (trace_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise RuntimeError("recovery request requires exactly one session-role resolution")
+    (
+        session_role,
+        resolved_session_id,
+        resolved_session_digest,
+        lifecycle_snapshot_digest,
+        verified_lifecycle_digest,
+        canonical,
+        resolution_digest,
+    ) = (str(value) for value in rows[0])
+    expected_canonical, expected_digest = _session_resolution_evidence(
+        session_role=session_role,
+        resolved_session_id=resolved_session_id,
+        resolved_session_digest=resolved_session_digest,
+        lifecycle_snapshot_digest=lifecycle_snapshot_digest,
+        verified_lifecycle_digest=verified_lifecycle_digest,
+    )
+    if canonical != expected_canonical or resolution_digest != expected_digest:
+        raise RuntimeError("session-role resolution record is not content addressed")
+    session = connection.execute(
+        """
+        SELECT state, session_identity_digest, lifecycle_snapshot_digest
+        FROM sessions
+        WHERE session_id = ?
+        """,
+        (resolved_session_id,),
+    ).fetchone()
+    if session is None:
+        raise RuntimeError("resolved session no longer exists")
+    state, session_digest, session_lifecycle_digest = (
+        str(value) for value in session
+    )
+    if (
+        state != RecoverySessionState.ACTIVE.value
+        or session_digest != resolved_session_digest
+        or session_lifecycle_digest != lifecycle_snapshot_digest
+    ):
+        raise RuntimeError("session-role resolution differs from session readback")
+    return SessionRoleResolutionReadback(
+        session_role=session_role,
+        resolved_session_id=resolved_session_id,
+        resolved_session_digest=resolved_session_digest,
+        lifecycle_snapshot_digest=lifecycle_snapshot_digest,
+        verified_lifecycle_digest=verified_lifecycle_digest,
+        canonical=canonical,
+        digest=resolution_digest,
+    )
 
 
 def _record_selection(
@@ -3414,6 +4067,9 @@ def _lifecycle_reference_matches_fixture(
 
 def _cutover_readback(
     connection: sqlite3.Connection,
+    *,
+    old_session_id: str,
+    replacement_session_id: str,
 ) -> tuple[RecoverySessionState, RecoverySessionState, str, str]:
     rows = {
         str(session_id): (
@@ -3439,7 +4095,7 @@ def _cutover_readback(
             """
         )
     }
-    if set(rows) != {OLD_SESSION_ID, REPLACEMENT_SESSION_ID}:
+    if set(rows) != {old_session_id, replacement_session_id}:
         raise RuntimeError("cutover fixture has an unexpected session identity set")
     (
         old_principal,
@@ -3447,7 +4103,7 @@ def _cutover_readback(
         old_identity_digest,
         old_digest,
         old_lifecycle_digest,
-    ) = rows[OLD_SESSION_ID]
+    ) = rows[old_session_id]
     (
         replacement_principal,
         replacement_state,
@@ -3455,16 +4111,16 @@ def _cutover_readback(
         replacement_digest,
         replacement_lifecycle_digest,
     ) = rows[
-        REPLACEMENT_SESSION_ID
+        replacement_session_id
     ]
     if old_principal != PRINCIPAL_ID or replacement_principal != PRINCIPAL_ID:
         raise RuntimeError("cutover fixture session principal binding is invalid")
     if old_digest is not None or replacement_digest is None:
         raise RuntimeError("cutover fixture entitlement binding is invalid")
-    if old_identity_digest != _session_identity_digest(OLD_SESSION_ID):
+    if old_identity_digest != _session_identity_digest(old_session_id):
         raise RuntimeError("old session row has an invalid identity digest")
     if replacement_identity_digest != _session_identity_digest(
-        REPLACEMENT_SESSION_ID
+        replacement_session_id
     ):
         raise RuntimeError("replacement session row has an invalid identity digest")
     if old_lifecycle_digest != replacement_lifecycle_digest:
@@ -3563,6 +4219,7 @@ def _events(
     action: dict[str, Any],
     action_canonical: str,
     action_digest: str,
+    session_resolution: SessionRoleResolutionReadback,
     requested_ids: tuple[str, ...],
     lifecycle_before: LifecycleReferenceReadback,
     lifecycle_after: LifecycleReferenceReadback,
@@ -3642,7 +4299,31 @@ def _events(
                 ("action", _required_text(action, "action")),
                 ("request_id", _required_text(action, "request_id")),
                 ("principal_id", PRINCIPAL_ID),
-                ("session_id", REPLACEMENT_SESSION_ID),
+                ("session_role", session_resolution.session_role),
+                (
+                    "resolved_session_id",
+                    session_resolution.resolved_session_id,
+                ),
+                (
+                    "resolved_session_digest",
+                    session_resolution.resolved_session_digest,
+                ),
+                (
+                    "session_resolution_canonical",
+                    session_resolution.canonical,
+                ),
+                (
+                    "session_resolution_digest",
+                    session_resolution.digest,
+                ),
+                (
+                    "session_resolution_lifecycle_snapshot_digest",
+                    session_resolution.lifecycle_snapshot_digest,
+                ),
+                (
+                    "session_resolution_verified_lifecycle_digest",
+                    session_resolution.verified_lifecycle_digest,
+                ),
                 ("clone_id", clone_id),
                 ("clone_nonce", clone_nonce),
                 ("storage_kind", clone_storage_kind),
@@ -3690,7 +4371,10 @@ def _events(
                 ("old_session_id", OLD_SESSION_ID),
                 ("old_session_state", old_state.value),
                 ("old_session_revoked", old_state == RecoverySessionState.REVOKED),
-                ("replacement_session_id", REPLACEMENT_SESSION_ID),
+                (
+                    "replacement_session_id",
+                    session_resolution.resolved_session_id,
+                ),
                 ("replacement_session_state", replacement_state.value),
                 (
                     "replacement_session_active",

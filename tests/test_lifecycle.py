@@ -407,6 +407,23 @@ def test_shared_source_evidence_and_disclosure_ledger_are_valid() -> None:
     assert verified.incident_id == "incident-001"
 
 
+def test_unreferenced_admitted_receipt_is_rejected() -> None:
+    unused = disclosure(
+        token="record-never-disclosed",
+        trace_id="unused-receipt-trace",
+        event_label="unused-receipt-event",
+    )
+
+    with pytest.raises(
+        LifecycleVerificationError,
+        match="exactly match disclosed ledger entries",
+    ):
+        verify_lifecycle(
+            make_lifecycle(),
+            admitted_receipts=(receipt_for(unused),),
+        )
+
+
 def test_later_branch_event_reuse_is_rejected() -> None:
     shared_event = digest("reused-post-fork-event")
     actual = make_branch(

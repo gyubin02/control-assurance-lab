@@ -56,7 +56,13 @@ OUTCOME_COMPONENT = "recovery-client"
 
 PRINCIPAL_ID = "support-017"
 OLD_SESSION_ID = "SYNTH-SESSION-SUPPORT-017-OLD"
+# The action is stable across the matched target contrast.  A lifecycle branch
+# resolves this role to its own independently produced replacement session.
+ACTIVE_REPLACEMENT_SESSION_ROLE = "active-replacement"
 REPLACEMENT_SESSION_ID = "SYNTH-SESSION-SUPPORT-017-REPLACEMENT"
+COMPARISON_REPLACEMENT_SESSION_ID = (
+    "SYNTH-SESSION-SUPPORT-017-REPLACEMENT-COMPARISON"
+)
 APPROVED_CASE_ID = "CASE-000017"
 APPROVED_CUSTOMER_ID = "SYNTH-CUSTOMER-000017"
 
@@ -72,7 +78,7 @@ def action_descriptor(level: StringValue) -> dict[str, Any]:
     common: dict[str, Any] = {
         "schema": "assurance-lab.recovery-export-action/v1",
         "principal_id": PRINCIPAL_ID,
-        "session_id": REPLACEMENT_SESSION_ID,
+        "session_role": ACTIVE_REPLACEMENT_SESSION_ROLE,
         "data_class": "synthetic-customer-confidential",
         "purpose": "post-restore-control-retest",
     }
@@ -137,7 +143,11 @@ def snapshot_descriptor(level: StringValue) -> dict[str, Any]:
 def session_identity_descriptor(session_id: str) -> dict[str, str]:
     """Return the canonical identity bound into lifecycle session digests."""
 
-    if session_id not in {OLD_SESSION_ID, REPLACEMENT_SESSION_ID}:
+    if session_id not in {
+        OLD_SESSION_ID,
+        REPLACEMENT_SESSION_ID,
+        COMPARISON_REPLACEMENT_SESSION_ID,
+    }:
         raise ValueError("unsupported synthetic recovery session identity")
     return {
         "schema": "assurance-lab.synthetic-session-identity/v1",
@@ -162,6 +172,9 @@ APPROVED_SNAPSHOT_DIGEST = _digest(snapshot_descriptor(TARGET_EFFECTIVE))
 OLD_SESSION_DIGEST = _digest(session_identity_descriptor(OLD_SESSION_ID))
 REPLACEMENT_SESSION_DIGEST = _digest(
     session_identity_descriptor(REPLACEMENT_SESSION_ID)
+)
+COMPARISON_REPLACEMENT_SESSION_DIGEST = _digest(
+    session_identity_descriptor(COMPARISON_REPLACEMENT_SESSION_ID)
 )
 
 
@@ -414,7 +427,7 @@ def build_financial_recovery_contract(
         ),
         _obligation(
             "replacement-session-is-active-at-retest",
-            subject=REPLACEMENT_SESSION_ID,
+            subject=ACTIVE_REPLACEMENT_SESSION_ROLE,
             component=TARGET_COMPONENT,
             scope=ObligationScope.TARGET_LOCAL,
             selector=CellSelector(),
@@ -424,7 +437,7 @@ def build_financial_recovery_contract(
         ),
         _obligation(
             "replacement-session-binds-restored-entitlements",
-            subject=REPLACEMENT_SESSION_ID,
+            subject=ACTIVE_REPLACEMENT_SESSION_ROLE,
             component=TARGET_COMPONENT,
             scope=ObligationScope.TARGET_LOCAL,
             selector=CellSelector(),

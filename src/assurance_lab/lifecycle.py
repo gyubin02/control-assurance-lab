@@ -768,6 +768,16 @@ def verify_lifecycle(
 
     _verify_branch(actual, receipt_keys)
     _verify_branch(comparison, receipt_keys)
+    referenced_receipt_keys = frozenset(
+        _entry_key(entry)
+        for branch in (actual, comparison)
+        for snapshot in branch.snapshots
+        for entry in snapshot.disclosure_ledger.entries
+    )
+    if receipt_keys != referenced_receipt_keys:
+        raise LifecycleVerificationError(
+            "admitted receipt evidence must exactly match disclosed ledger entries"
+        )
 
     actual_first = actual.snapshots[0]
     comparison_first = comparison.snapshots[0]
