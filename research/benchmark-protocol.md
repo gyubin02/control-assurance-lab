@@ -95,8 +95,31 @@ changed file with internally updated hashes tests semantic verification.
 | C19 | claim that fallback telemetry was forwarded while disconnecting the forwarded read-back from the alert input | reject causal path binding |
 | C20 | label a run as reload/reapply while omitting the persisted pre/post operation receipt | reject sham attestation |
 
-The released corruption generator must be deterministic and must record whether it
-rebuilt the manifest.
+The released corruption generator must be deterministic and must prove whether it
+rebuilt the manifest. A `KEEP` case must retain the exact source manifest and fail
+CAB integrity. A `REBUILD` case must carry a changed manifest and pass CAB integrity.
+
+### Frozen corruption representation
+
+The first release freezes one representation instead of claiming a generic
+mutation engine. A source is a bounded deterministic CAB snapshot. Mutation
+targets are either one canonical JSON object or canonical JSONL records with
+unique, lexically sorted string `id` fields. Each C01–C20 entry fixes:
+
+- the source scenario and CAB member path;
+- the exact record selector (`$` for the single root object of a `.json`
+  member, or the producer-owned `id` of one `.jsonl` record) and JSON Pointer;
+- one complete operation and all of its operands;
+- `KEEP` or `REBUILD`; and
+- the required negative verifier result.
+
+The operation set is limited to replacement, removal, array-item removal,
+copy-from-record, and swap-with-record. The replay engine extracts the real
+before value, performs that exact operation, canonicalizes the target member,
+and encodes the complete CAB. It does not accept a collaborator-authored
+“execution” object. Archives, binary databases, protobufs, and other production
+representations are outside this profile until they define an equally precise
+canonical locator and replay contract.
 
 Fresh-clone identities remain unique, but benchmark generation injects a deterministic
 nonce source so that two releases from the frozen inputs are byte-identical. Production
@@ -139,6 +162,44 @@ ID by itself is not portable evidence.
 
 Agreement means semantic equality of these outputs, not byte-for-byte equality of
 two programs' internal objects.
+
+### Release admission boundary
+
+The common benchmark package does not accept a result model as proof of its own
+contents. `admit_benchmark_release` resolves the source corpus once and then
+admits the semantic and corruption corpora against that same resolution:
+
+- parses canonical bytes with duplicate-key and resource limits;
+- resolves every source CAB by the snapshot digest in the index and verifies its
+  manifest;
+- loads the exact compiled specification, recompiles its ordinary experiment
+  contract and benchmark plan, and byte-compares the result with the supplied
+  frozen plan;
+- recomputes the corpus digest over every index edge and the exact three
+  recompiled plan digests;
+- binds the index to the exact three raw trial sets and rejects any lineage or
+  runtime-artifact reuse across all 144 executions;
+- resolves every action and runtime artifact by content digest from that same
+  CAB, checks its declared schema, and requires a CAB member for every
+  attestation digest before invoking the scenario-specific verifier;
+- requires every semantic trial and aggregate to equal that independent
+  recomputation; and
+- binds both the per-scenario and top-level semantic result bytes to the index.
+
+C01–C20 follow the same rule. Their mutation type, source scenario, locator,
+complete recipe, manifest policy, and expected verifier result are frozen. A
+release verifier replays each mutation against the already admitted source CAB,
+compares the complete corrupted bytes, verifies before/after witnesses, and
+proves the manifest policy. The independent verifier must return a typed receipt
+that binds its pinned identity, the source and corrupted digests, the mutation
+specification digest, the normalized negative issues, and the result. The outer
+corruption receipt addresses that exact verifier receipt. A bare verdict or a
+receipt alone is never accepted as evidence that the mutation happened.
+
+The final public corpus still depends on scenario-specific artifact semantics
+and an independent second verifier. Resolver/verifier authentication, signature
+trust, freshness, custody, and external immutability remain outside this
+benchmark model.
 
 ## Stop conditions
 
