@@ -52,7 +52,15 @@ def _reject_constant(value: str) -> NoReturn:
 def _parse_int(value: str) -> int:
     if value == "-0":
         raise StrictJSONError("negative zero is not allowed")
-    parsed = int(value)
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > len(str(I_JSON_MAX_INTEGER)):
+        raise StrictJSONError("JSON integer exceeds the interoperable I-JSON range")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        # Python limits decimal-to-integer conversion length.  A hostile JSON
+        # number must remain a parser decision, not escape as a runtime error.
+        raise StrictJSONError("JSON integer exceeds the parser resource limit") from exc
     if abs(parsed) > I_JSON_MAX_INTEGER:
         raise StrictJSONError("JSON integer exceeds the interoperable I-JSON range")
     return parsed

@@ -12,6 +12,7 @@ authors = [
   { name = "Gyubin Lee" },
 ]
 dependencies = [
+  "cryptography>=46,<47",
   "pydantic>=2.12,<3",
   "PyYAML>=6.0.2,<7",
   "rfc8785>=0.1.4,<1",
@@ -22,6 +23,7 @@ assurance-lab = "assurance_lab.cli:main"
 
 [project.optional-dependencies]
 dev = [
+  "hatchling>=1.26,<2",
   "hypothesis>=6.130,<7",
   "mypy>=1.15,<2",
   "pytest>=8.3,<9",
