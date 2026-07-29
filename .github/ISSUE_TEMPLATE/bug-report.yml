@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible problem that is not a security vulnerability
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please use the repository's private **Report a vulnerability** path for security issues. Do not attach credentials, customer data, or production evidence here.
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happened?
+      description: Include the exact command and the smallest synthetic reproduction you can share.
+      placeholder: |
+        Command:
+        Observed result:
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Release tag or commit SHA
+      placeholder: v0.1.0 or 0123456789abcdef
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Python version, Node version, and filesystem when relevant
+    validations:
+      required: true
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Evidence hygiene
+      options:
+        - label: I removed secrets, credentials, customer data, and production logs.
+          required: true
