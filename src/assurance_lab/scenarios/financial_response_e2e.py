@@ -13,10 +13,12 @@ integrity-only run.  It does not authenticate who supplied those bytes.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Literal, overload
 
@@ -90,6 +92,7 @@ from assurance_lab.scenarios.financial_response_contract import (
     COMPROMISED_PRINCIPAL_ID,
     COMPROMISED_SESSION_ID,
     SCENARIO_ID,
+    SHAM_RELOAD,
     SIBLING_SESSION_ID,
     TARGET_EFFECTIVE,
     UNRELATED_PRINCIPAL_ID,
@@ -98,6 +101,7 @@ from assurance_lab.scenarios.financial_response_contract import (
     build_financial_response_contract,
 )
 from assurance_lab.scenarios.financial_response_runtime import (
+    RESPONDER_CONFIG_DIGEST,
     BaselineVerdict,
     FinancialResponseRuntime,
     FinancialResponseRuntimeResult,
@@ -105,11 +109,18 @@ from assurance_lab.scenarios.financial_response_runtime import (
     MutationReceipt,
     PrincipalReadback,
     ResourceIdentityReceipt,
+    ResponderRuntimeReadback,
+    ResponderShamReceipt,
+    ResponseActionReceipt,
     ResponseCaseAssessment,
     ResponseResidualClassification,
     ResponseStatusAndReplayBaseline,
     RuntimeEvent,
     SessionReadback,
+    _expected_responder_instance_id,
+    _expected_response_action_operation_id,
+    _expected_sham_operation_id,
+    responder_config_descriptor,
 )
 
 Digest = Annotated[str, Field(pattern=DIGEST_PATTERN)]
@@ -120,6 +131,7 @@ _SPEC_PATH = "spec/experiment.json"
 _SOURCE_SET_PATH = "spec/runtime-source-set.json"
 _SNAPSHOT_PATH = "spec/identity-snapshot.json"
 _FIXTURE_PATH = "spec/response-fixture.json"
+_RESPONDER_CONFIG_PATH = "spec/responder-config.json"
 _STAGE_PATH = "records/stage-events.jsonl"
 _RUNTIME_OBSERVATION_PATH = "records/runtime-observations.jsonl"
 _METRIC_PATH = "records/metric-observations.jsonl"
@@ -129,15 +141,21 @@ _TRIAL_PATH = "records/trial-records.jsonl"
 _RUNNER_RESOURCE_ID: Literal["financial-response-sqlite-runner"] = (
     "financial-response-sqlite-runner"
 )
-_SOURCE_SET_PATHS = (
-    "contract.py",
-    "evaluation.py",
-    "evidence/bundle.py",
-    "evidence/canonical.py",
-    "evidence/writer.py",
-    "scenarios/financial_response_contract.py",
-    "scenarios/financial_response_e2e.py",
-    "scenarios/financial_response_runtime.py",
+_SOURCE_SET_ROOT_MODULES = (
+    "assurance_lab.scenarios.financial_response_e2e",
+)
+_SOURCE_SET_MODULES = (
+    "assurance_lab",
+    "assurance_lab.contract",
+    "assurance_lab.evaluation",
+    "assurance_lab.evidence",
+    "assurance_lab.evidence.bundle",
+    "assurance_lab.evidence.canonical",
+    "assurance_lab.evidence.writer",
+    "assurance_lab.scenarios",
+    "assurance_lab.scenarios.financial_response_contract",
+    "assurance_lab.scenarios.financial_response_e2e",
+    "assurance_lab.scenarios.financial_response_runtime",
 )
 _IDENTITY_SNAPSHOT = {
     "schema": "assurance-lab.synthetic-identity-snapshot/v1",
@@ -185,21 +203,144 @@ def _digest_value(value: object) -> str:
 
 
 def _source_set_descriptor() -> dict[str, object]:
-    package_root = Path(__file__).resolve().parents[1]
-    files = []
-    for relative in _SOURCE_SET_PATHS:
-        content = package_root.joinpath(*relative.split("/")).read_bytes()
+    source_root = Path(__file__).resolve().parents[2]
+    observed_modules = _local_python_dependency_closure(
+        source_root,
+        _SOURCE_SET_ROOT_MODULES,
+    )
+    expected_modules = frozenset(_SOURCE_SET_MODULES)
+    if observed_modules != expected_modules:
+        missing = sorted(observed_modules.difference(expected_modules))
+        stale = sorted(expected_modules.difference(observed_modules))
+        raise RuntimeError(
+            "financial-response source allowlist differs from its local Python "
+            f"dependency closure; missing={missing!r}; stale={stale!r}"
+        )
+    files: list[dict[str, object]] = []
+    for module in sorted(observed_modules):
+        path = _local_module_path(source_root, module)
+        content = path.read_bytes()
         files.append(
             {
-                "path": f"assurance_lab/{relative}",
+                "module": module,
+                "path": path.relative_to(source_root).as_posix(),
                 "sha256": _sha256(content),
                 "size": len(content),
             }
         )
     return {
         "schema": "assurance-lab.financial-response-source-set/v1",
+        "claim_boundary": (
+            "integrity-only: identifies the statically imported local Python "
+            "dependency closure; does not authenticate author, origin, the "
+            "Python runtime, standard library, or third-party packages"
+        ),
+        "dependency_resolver": "python-ast-local-import-closure/v1",
+        "root_modules": list(_SOURCE_SET_ROOT_MODULES),
         "files": files,
     }
+
+
+def _local_python_dependency_closure(
+    source_root: Path,
+    root_modules: tuple[str, ...],
+) -> frozenset[str]:
+    discovered: set[str] = set()
+    pending = list(root_modules)
+    while pending:
+        module = pending.pop()
+        if module in discovered:
+            continue
+        path = _local_module_path(source_root, module)
+        discovered.add(module)
+        for package in _parent_package_modules(source_root, module):
+            if package not in discovered:
+                pending.append(package)
+        for imported in _local_imports(source_root, module, path):
+            if imported not in discovered:
+                pending.append(imported)
+    return frozenset(discovered)
+
+
+def _local_module_path(source_root: Path, module: str) -> Path:
+    if module != "assurance_lab" and not module.startswith("assurance_lab."):
+        raise RuntimeError(f"source closure contains a non-local module: {module!r}")
+    relative = Path(*module.split("."))
+    module_path = source_root / relative.with_suffix(".py")
+    package_path = source_root / relative / "__init__.py"
+    if module_path.is_file():
+        return module_path
+    if package_path.is_file():
+        return package_path
+    raise RuntimeError(f"local Python module has no source file: {module!r}")
+
+
+def _local_module_exists(source_root: Path, module: str) -> bool:
+    try:
+        _local_module_path(source_root, module)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _parent_package_modules(
+    source_root: Path,
+    module: str,
+) -> tuple[str, ...]:
+    parts = module.split(".")
+    packages: list[str] = []
+    for index in range(1, len(parts)):
+        candidate = ".".join(parts[:index])
+        if (
+            _local_module_exists(source_root, candidate)
+            and _local_module_path(source_root, candidate).name == "__init__.py"
+        ):
+            packages.append(candidate)
+    return tuple(packages)
+
+
+def _local_imports(
+    source_root: Path,
+    module: str,
+    path: Path,
+) -> frozenset[str]:
+    try:
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+    except (SyntaxError, ValueError) as error:
+        raise RuntimeError(f"cannot parse local source dependency {module!r}") from error
+    package = module if path.name == "__init__.py" else module.rpartition(".")[0]
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            candidates = tuple(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolved_import_from(package, node)
+            candidates = (
+                base,
+                *(f"{base}.{alias.name}" for alias in node.names),
+            )
+        else:
+            continue
+        for candidate in candidates:
+            if (
+                candidate == "assurance_lab"
+                or candidate.startswith("assurance_lab.")
+            ) and _local_module_exists(source_root, candidate):
+                imports.add(candidate)
+    return frozenset(imports)
+
+
+def _resolved_import_from(package: str, node: ast.ImportFrom) -> str:
+    if node.level == 0:
+        return node.module or ""
+    package_parts = package.split(".")
+    keep = len(package_parts) - (node.level - 1)
+    if keep < 1:
+        raise RuntimeError("relative import escapes the assurance_lab package")
+    base_parts = package_parts[:keep]
+    if node.module:
+        base_parts.extend(node.module.split("."))
+    return ".".join(base_parts)
 
 
 FINANCIAL_RESPONSE_SOURCE_SET_DIGEST = _digest_value(_source_set_descriptor())
@@ -303,6 +444,7 @@ class _ResponseFixtureArtifact(_ArtifactModel):
     benign_action: FinancialResponseActionArtifact
     attack_action_digest: Digest
     benign_action_digest: Digest
+    responder_config_digest: Digest
 
     @model_validator(mode="after")
     def fixed_fixture(self) -> _ResponseFixtureArtifact:
@@ -310,6 +452,7 @@ class _ResponseFixtureArtifact(_ArtifactModel):
             self.identity_snapshot_digest != FINANCIAL_RESPONSE_SNAPSHOT_DIGEST
             or self.attack_action_digest != ATTACK_ACTION_DIGEST
             or self.benign_action_digest != BENIGN_ACTION_DIGEST
+            or self.responder_config_digest != RESPONDER_CONFIG_DIGEST
             or _digest_value(
                 self.attack_action.model_dump(mode="json", by_alias=True)
             )
@@ -382,6 +525,38 @@ class _PrincipalRow(_ArtifactModel):
     quarantined: bool
 
 
+class _ResponderRuntimeRow(_ArtifactModel):
+    clone_nonce: str = Field(min_length=1)
+    instance_id: str = Field(min_length=1)
+    generation: int = Field(ge=0)
+    config_digest: Digest
+
+
+class _ResponderShamReceiptArtifact(_ArtifactModel):
+    operation_id: str = Field(min_length=1)
+    operation: Literal["steady-observation", "reload"]
+    clone_nonce: str = Field(min_length=1)
+    before_instance_id: str = Field(min_length=1)
+    after_instance_id: str = Field(min_length=1)
+    before_generation: int = Field(ge=0)
+    after_generation: int = Field(ge=0)
+    config_digest: Digest
+    rows_affected: int = Field(ge=0)
+
+
+class _ResponseActionReceiptArtifact(_ArtifactModel):
+    operation_id: str = Field(min_length=1)
+    responder_instance_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    action_digest: Digest
+    target_mode: str = Field(min_length=1)
+    principal_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    operation: Literal["not-triggered", "report-only", "revoke-exact"]
+    status: Literal["not-triggered", "reported-success"]
+    rows_affected: int = Field(ge=0)
+
+
 class _MutationReceiptArtifact(_ArtifactModel):
     component: Literal["session-revoker", "principal-quarantine"]
     operation: Literal["not-triggered", "report-only", "revoke-exact", "quarantine"]
@@ -439,11 +614,10 @@ class FinancialResponseRuntimeObservationArtifact(_ArtifactModel):
     trace_id: str = Field(min_length=1)
     action_digest: Digest
     resource_identity: _ResourceIdentityArtifact
-    response_action_status: Literal[
-        "not-triggered",
-        "reported-success",
-        "reported-failure",
-    ]
+    responder_before_sham: _ResponderRuntimeRow
+    responder_after_sham: _ResponderRuntimeRow
+    sham_operation: _ResponderShamReceiptArtifact
+    response_action: _ResponseActionReceiptArtifact
     sessions_before_target: tuple[_SessionRow, ...]
     sessions_after_target: tuple[_SessionRow, ...]
     sessions_after_compensator: tuple[_SessionRow, ...]
@@ -606,6 +780,11 @@ _PAYLOAD_METADATA = {
         "fixed exact-session response fixture",
         ("scope", "attestation"),
     ),
+    _RESPONDER_CONFIG_PATH: _PayloadMetadata(
+        "application/json",
+        "synthetic persisted responder configuration",
+        ("scope", "runtime-reconstruction", "attestation"),
+    ),
     _RUNTIME_OBSERVATION_PATH: _PayloadMetadata(
         "application/x-ndjson",
         "raw SQLite rows and gateway query receipts",
@@ -692,6 +871,7 @@ def _fixture_manifest() -> dict[str, object]:
         "benign_action": action_descriptor(BENIGN),
         "attack_action_digest": ATTACK_ACTION_DIGEST,
         "benign_action_digest": BENIGN_ACTION_DIGEST,
+        "responder_config_digest": RESPONDER_CONFIG_DIGEST,
     }
 
 
@@ -716,6 +896,48 @@ def _principal_rows(
             quarantined=value.quarantined,
         )
         for value in values
+    )
+
+
+def _responder_row(value: ResponderRuntimeReadback) -> _ResponderRuntimeRow:
+    return _ResponderRuntimeRow(
+        clone_nonce=value.clone_nonce,
+        instance_id=value.instance_id,
+        generation=value.generation,
+        config_digest=value.config_digest,
+    )
+
+
+def _sham_receipt(
+    value: ResponderShamReceipt,
+) -> _ResponderShamReceiptArtifact:
+    return _ResponderShamReceiptArtifact(
+        operation_id=value.operation_id,
+        operation=value.operation,
+        clone_nonce=value.clone_nonce,
+        before_instance_id=value.before_instance_id,
+        after_instance_id=value.after_instance_id,
+        before_generation=value.before_generation,
+        after_generation=value.after_generation,
+        config_digest=value.config_digest,
+        rows_affected=value.rows_affected,
+    )
+
+
+def _response_action_receipt(
+    value: ResponseActionReceipt,
+) -> _ResponseActionReceiptArtifact:
+    return _ResponseActionReceiptArtifact(
+        operation_id=value.operation_id,
+        responder_instance_id=value.responder_instance_id,
+        trace_id=value.trace_id,
+        action_digest=value.action_digest,
+        target_mode=value.target_mode,
+        principal_id=value.principal_id,
+        session_id=value.session_id,
+        operation=value.operation,
+        status=value.status.value,
+        rows_affected=value.rows_affected,
     )
 
 
@@ -767,7 +989,12 @@ def _runtime_observation(
         trace_id=result.trace_id,
         action_digest=result.action_digest,
         resource_identity=_resource_receipt(result.resource_identity),
-        response_action_status=result.response_action_status.value,
+        responder_before_sham=_responder_row(result.responder_before_sham),
+        responder_after_sham=_responder_row(result.responder_after_sham),
+        sham_operation=_sham_receipt(result.sham_operation),
+        response_action=_response_action_receipt(
+            result.response_action_receipt
+        ),
         sessions_before_target=_session_rows(result.sessions_before_target),
         sessions_after_target=_session_rows(result.sessions_after_target),
         sessions_after_compensator=_session_rows(
@@ -834,6 +1061,7 @@ class FinancialResponseExperimentRunner:
         self._source_set = _source_set_descriptor()
         self._snapshot = _IDENTITY_SNAPSHOT
         self._fixture = _fixture_manifest()
+        self._responder_config = responder_config_descriptor()
         self.build_digest = FINANCIAL_RESPONSE_SOURCE_SET_DIGEST
         self.dataset_digest = FINANCIAL_RESPONSE_SNAPSHOT_DIGEST
         self.fixture_digest = _digest_value(self._fixture)
@@ -1024,6 +1252,10 @@ class FinancialResponseExperimentRunner:
             _payload_file(
                 _FIXTURE_PATH,
                 canonical_json_bytes(self._fixture),
+            ),
+            _payload_file(
+                _RESPONDER_CONFIG_PATH,
+                canonical_json_bytes(self._responder_config),
             ),
             _payload(
                 _RUNTIME_OBSERVATION_PATH,
@@ -1339,6 +1571,7 @@ class FinancialResponseBundleRepository:
 
         snapshot_bytes = self._read_rehashed(_SNAPSHOT_PATH)
         fixture_bytes = self._read_rehashed(_FIXTURE_PATH)
+        responder_config_bytes = self._read_rehashed(_RESPONDER_CONFIG_PATH)
         try:
             snapshot = _IdentitySnapshotArtifact.model_validate_json(
                 snapshot_bytes,
@@ -1348,6 +1581,7 @@ class FinancialResponseBundleRepository:
                 fixture_bytes,
                 strict=True,
             )
+            responder_config = strict_json_loads(responder_config_bytes)
         except ValueError as error:
             raise FinancialResponseBundleError(
                 f"response provenance failed strict validation: {error}"
@@ -1357,14 +1591,20 @@ class FinancialResponseBundleRepository:
             != snapshot_bytes
             or canonical_json_bytes(fixture.model_dump(mode="json", by_alias=True))
             != fixture_bytes
+            or responder_config != responder_config_descriptor()
+            or canonical_json_bytes(responder_config) != responder_config_bytes
+            or _sha256(responder_config_bytes) != RESPONDER_CONFIG_DIGEST
+            or fixture.responder_config_digest != RESPONDER_CONFIG_DIGEST
         ):
             raise FinancialResponseBundleError(
-                "response provenance differs from its canonical model"
+                "response responder configuration or provenance differs from "
+                "its verifier-owned canonical model"
             )
         self.attack_action = fixture.attack_action
         self.benign_action = fixture.benign_action
         self.dataset_digest = _sha256(snapshot_bytes)
         self.fixture_digest = _sha256(fixture_bytes)
+        self.responder_config_digest = _sha256(responder_config_bytes)
         if (
             self.dataset_digest != scope.dataset_digest
             or self.fixture_digest != scope.fixture_digest
@@ -1609,11 +1849,21 @@ class FinancialResponseBundleRepository:
         for record in self.trial_records:
             planned_trial = planned[record.trial_key]
             selector = selectors[planned_trial.cell_key]
+            expected_trace_id = (
+                f"financial-response-trace-{planned_trial.ordinal:04d}-"
+                f"{planned_trial.key[-12:]}"
+            )
+            expected_clone_id = (
+                f"response-sqlite-clone-{planned_trial.ordinal:04d}-"
+                f"{planned_trial.key[-12:]}"
+            )
             if (
                 record.spec_digest != compiled.spec_digest
                 or record.cell_key != planned_trial.cell_key
                 or record.block != planned_trial.block
                 or record.replicate != planned_trial.replicate
+                or record.trace.trace_id != expected_trace_id
+                or record.clone.unique_instance_id != expected_clone_id
             ):
                 raise FinancialResponseBundleError(
                     f"trial {record.trial_key} differs from compiler plan"
@@ -1645,7 +1895,9 @@ class FinancialResponseBundleRepository:
             )
             resource = runtime_observation.resource_identity
             if (
-                attestation.ordinal != planned_trial.ordinal
+                attestation.id
+                != f"response-attestation-{planned_trial.ordinal:04d}"
+                or attestation.ordinal != planned_trial.ordinal
                 or attestation.observed_selector != selector
                 or attestation.action_digest != expected_action
                 or record.trace.action_digest != expected_action
@@ -1667,6 +1919,8 @@ class FinancialResponseBundleRepository:
                 or runtime_observation.spec_digest != record.spec_digest
                 or runtime_observation.trace_id != record.trace.trace_id
                 or runtime_observation.action_digest != expected_action
+                or runtime_observation.id
+                != f"{record.trial_key}:runtime-observation"
                 or resource.requested_clone_nonce
                 != record.clone.unique_instance_id
                 or resource.observed_clone_nonce
@@ -1720,6 +1974,25 @@ class FinancialResponseBundleRepository:
                     )
                 used_stage_digests.add(digest)
 
+            ordered_stages = tuple(
+                self._stages_by_coordinate[(record.trial_key, stage)][0]
+                for stage in Stage
+            )
+            if (
+                attestation.started_at < scope.evidence_window.start
+                or attestation.started_at >= ordered_stages[0].started_at
+                or any(
+                    previous.ended_at >= current.started_at
+                    for previous, current in pairwise(ordered_stages)
+                )
+                or ordered_stages[-1].ended_at >= attestation.ended_at
+                or attestation.ended_at > scope.evidence_window.end
+                or attestation.ended_at > scope.assessment_as_of
+            ):
+                raise FinancialResponseBundleError(
+                    f"trial {record.trial_key} has an impossible evidence timeline"
+                )
+
             for metric_id, (stage, field_name, subject_id) in _METRIC_BINDINGS.items():
                 observation, observation_digest = self._metrics[
                     (record.trial_key, metric_id)
@@ -1734,7 +2007,8 @@ class FinancialResponseBundleRepository:
                     )
                 metric_contract = metric_contracts[metric_id]
                 if (
-                    observation.spec_digest != record.spec_digest
+                    observation.id != f"{record.trial_key}:{metric_id}"
+                    or observation.spec_digest != record.spec_digest
                     or observation.trace_id != record.trace.trace_id
                     or observation.event_id != stage_artifact.event_id
                     or observation.event_digest != stage_digest
@@ -1763,7 +2037,14 @@ class FinancialResponseBundleRepository:
                 raise FinancialResponseBundleError(
                     f"trial {record.trial_key} differs from cleanup evidence"
                 )
-            if cleanup.runtime_observation_digest != runtime_observation_digest:
+            if (
+                cleanup.id != f"response-cleanup-{planned_trial.ordinal:04d}"
+                or cleanup.runtime_observation_digest
+                != runtime_observation_digest
+                or cleanup.observed_at <= attestation.ended_at
+                or cleanup.observed_at > scope.evidence_window.end
+                or cleanup.observed_at > scope.assessment_as_of
+            ):
                 raise FinancialResponseBundleError(
                     f"trial {record.trial_key} cleanup is not bound to runtime rows"
                 )
@@ -1956,12 +2237,78 @@ def _derived_events(
     tuple[int, str, str, tuple[tuple[str, Scalar], ...]],
 ]:
     attack = selector.input == ATTACK
+    sham_level = _selector_text(selector.sham, "sham")
+    expected_sham_operation: Literal["steady-observation", "reload"] = (
+        "reload"
+        if sham_level == SHAM_RELOAD.value
+        else "steady-observation"
+    )
+    expected_after_generation = (
+        1 if expected_sham_operation == "reload" else 0
+    )
+    expected_sham_rows = 1 if expected_sham_operation == "reload" else 0
+    responder_before = observation.responder_before_sham
+    responder_after = observation.responder_after_sham
+    sham_receipt = observation.sham_operation
+    before_readback = ResponderRuntimeReadback(
+        clone_nonce=responder_before.clone_nonce,
+        instance_id=responder_before.instance_id,
+        generation=responder_before.generation,
+        config_digest=responder_before.config_digest,
+    )
+    after_readback = ResponderRuntimeReadback(
+        clone_nonce=responder_after.clone_nonce,
+        instance_id=responder_after.instance_id,
+        generation=responder_after.generation,
+        config_digest=responder_after.config_digest,
+    )
+    resource = observation.resource_identity
+    if (
+        responder_before.clone_nonce != resource.observed_clone_nonce
+        or responder_after.clone_nonce != resource.observed_clone_nonce
+        or responder_before.generation != 0
+        or responder_after.generation != expected_after_generation
+        or responder_before.config_digest != RESPONDER_CONFIG_DIGEST
+        or responder_after.config_digest != RESPONDER_CONFIG_DIGEST
+        or responder_before.instance_id
+        != _expected_responder_instance_id(
+            resource.observed_clone_nonce,
+            0,
+        )
+        or responder_after.instance_id
+        != _expected_responder_instance_id(
+            resource.observed_clone_nonce,
+            expected_after_generation,
+        )
+        or sham_receipt.operation != expected_sham_operation
+        or sham_receipt.operation_id
+        != _expected_sham_operation_id(
+            expected_sham_operation,
+            before_readback,
+            after_readback,
+        )
+        or sham_receipt.clone_nonce != resource.observed_clone_nonce
+        or sham_receipt.before_instance_id != responder_before.instance_id
+        or sham_receipt.after_instance_id != responder_after.instance_id
+        or sham_receipt.before_generation != responder_before.generation
+        or sham_receipt.after_generation != responder_after.generation
+        or sham_receipt.config_digest != RESPONDER_CONFIG_DIGEST
+        or sham_receipt.rows_affected != expected_sham_rows
+    ):
+        raise FinancialResponseBundleError(
+            "raw responder configuration or generation transition differs "
+            "from the planned intervention"
+        )
+
     expected_target_operation = (
         "revoke-exact"
         if attack and selector.target == TARGET_EFFECTIVE
         else "report-only"
         if attack
         else "not-triggered"
+    )
+    expected_response_status: Literal["not-triggered", "reported-success"] = (
+        "reported-success" if attack else "not-triggered"
     )
     expected_compensator_operation = (
         "quarantine"
@@ -1970,8 +2317,27 @@ def _derived_events(
     )
     target_receipt = observation.target_mutation
     compensator_receipt = observation.compensator_mutation
+    response_receipt = observation.response_action
     if (
-        target_receipt.component != "session-revoker"
+        response_receipt.operation_id
+        != _expected_response_action_operation_id(
+            trace_id=observation.trace_id,
+            action_digest=action_digest,
+            target_mode=_selector_text(selector.target, "target"),
+            responder_instance_id=responder_after.instance_id,
+        )
+        or response_receipt.responder_instance_id
+        != responder_after.instance_id
+        or response_receipt.trace_id != observation.trace_id
+        or response_receipt.action_digest != action_digest
+        or response_receipt.target_mode
+        != _selector_text(selector.target, "target")
+        or response_receipt.principal_id != COMPROMISED_PRINCIPAL_ID
+        or response_receipt.session_id != COMPROMISED_SESSION_ID
+        or response_receipt.operation != expected_target_operation
+        or response_receipt.status != expected_response_status
+        or response_receipt.rows_affected != target_receipt.rows_affected
+        or target_receipt.component != "session-revoker"
         or target_receipt.operation != expected_target_operation
         or target_receipt.principal_id != COMPROMISED_PRINCIPAL_ID
         or target_receipt.session_id != COMPROMISED_SESSION_ID
@@ -2028,6 +2394,28 @@ def _derived_events(
             "runtime observation differs from the fixed initial state"
         )
 
+    expected_target_sessions = dict(before_sessions)
+    if attack and selector.target == TARGET_EFFECTIVE:
+        expected_target_sessions[COMPROMISED_SESSION_ID] = (
+            COMPROMISED_PRINCIPAL_ID,
+            False,
+        )
+    expected_compensator_principals = dict(before_principals)
+    if attack and selector.compensator == COMPENSATOR_ON:
+        expected_compensator_principals[COMPROMISED_PRINCIPAL_ID] = (
+            "support",
+            True,
+        )
+    if (
+        target_sessions != expected_target_sessions
+        or target_principals != before_principals
+        or compensator_sessions != target_sessions
+        or compensator_principals != expected_compensator_principals
+    ):
+        raise FinancialResponseBundleError(
+            "runtime before/after rows differ from the fixed response transitions"
+        )
+
     target_modified = tuple(
         session_id
         for session_id in sorted(before_sessions)
@@ -2046,6 +2434,11 @@ def _derived_events(
     if (
         target_receipt.rows_affected != len(target_modified)
         or compensator_receipt.rows_affected != len(principal_modified)
+        or target_receipt.rows_affected
+        != (1 if attack and selector.target == TARGET_EFFECTIVE else 0)
+        or compensator_receipt.rows_affected
+        != (1 if attack and selector.compensator == COMPENSATOR_ON else 0)
+        or compensator_modified
     ):
         raise FinancialResponseBundleError(
             "runtime mutation row count differs from before/after readback"
@@ -2092,11 +2485,6 @@ def _derived_events(
                 "gateway query receipt differs from final identity rows"
             )
 
-    if not attack and observation.response_action_status != "not-triggered":
-        raise FinancialResponseBundleError(
-            "benign action has an impossible response status"
-        )
-
     compromised_active = target_sessions[COMPROMISED_SESSION_ID][1]
     non_target_active = all(
         value[1]
@@ -2115,7 +2503,7 @@ def _derived_events(
             (
                 ("action", str(action["action"])),
                 ("action_digest", action_digest),
-                ("sham", _selector_text(selector.sham, "sham")),
+                ("sham", sham_level),
             ),
         ),
         Stage.TARGET: (
@@ -2128,11 +2516,11 @@ def _derived_events(
                 ("target_session_id", COMPROMISED_SESSION_ID),
                 (
                     "response_action_status",
-                    observation.response_action_status,
+                    response_receipt.status,
                 ),
                 (
                     "response_action_reported_success",
-                    observation.response_action_status == "reported-success",
+                    response_receipt.status == "reported-success",
                 ),
                 ("exact_revocation_executed", exact_revoke_executed),
                 ("compromised_session_active", compromised_active),

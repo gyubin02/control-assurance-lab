@@ -12,7 +12,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import rfc8785
 
@@ -40,6 +40,33 @@ type Scalar = str | bool | int
 type Payload = tuple[tuple[str, Scalar], ...]
 
 _TRACE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+def responder_config_descriptor() -> dict[str, Any]:
+    """Return the exact synthetic responder configuration exercised here.
+
+    Its generation transition is persisted in SQLite.  It models configuration
+    continuity across a responder replacement; it is not evidence that an
+    operating-system process or production service was restarted.
+    """
+
+    return {
+        "schema": "assurance-lab.financial-response-responder-config/v1",
+        "component": "session-revoker",
+        "model_boundary": (
+            "synthetic persisted responder configuration generation transition; "
+            "not a process restart"
+        ),
+        "attack_status": "reported-success",
+        "benign_status": "not-triggered",
+        "target_subject": {
+            "principal_id": COMPROMISED_PRINCIPAL_ID,
+            "session_id": COMPROMISED_SESSION_ID,
+        },
+    }
+
+
+RESPONDER_CONFIG_DIGEST = (
+    f"sha256:{hashlib.sha256(rfc8785.dumps(responder_config_descriptor())).hexdigest()}"
+)
 
 
 class ResponseActionStatus(StrEnum):
@@ -87,6 +114,41 @@ class PrincipalReadback:
     principal_id: str
     role: str
     quarantined: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ResponderRuntimeReadback:
+    clone_nonce: str
+    instance_id: str
+    generation: int
+    config_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResponderShamReceipt:
+    operation_id: str
+    operation: Literal["steady-observation", "reload"]
+    clone_nonce: str
+    before_instance_id: str
+    after_instance_id: str
+    before_generation: int
+    after_generation: int
+    config_digest: str
+    rows_affected: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseActionReceipt:
+    operation_id: str
+    responder_instance_id: str
+    trace_id: str
+    action_digest: str
+    target_mode: str
+    principal_id: str
+    session_id: str
+    operation: Literal["not-triggered", "report-only", "revoke-exact"]
+    status: ResponseActionStatus
+    rows_affected: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +205,10 @@ class FinancialResponseRuntimeResult:
     compensator_modified_session_ids: tuple[str, ...]
     session_readbacks: tuple[SessionReadback, ...]
     principal_readbacks: tuple[PrincipalReadback, ...]
+    responder_before_sham: ResponderRuntimeReadback
+    responder_after_sham: ResponderRuntimeReadback
+    sham_operation: ResponderShamReceipt
+    response_action_receipt: ResponseActionReceipt
     sessions_before_target: tuple[SessionReadback, ...]
     sessions_after_target: tuple[SessionReadback, ...]
     sessions_after_compensator: tuple[SessionReadback, ...]
@@ -232,19 +298,46 @@ class FinancialResponseRuntime:
             clone_nonce=clone_nonce,
             runner_resource_id=runner_resource_id,
         )
+        responder_before_sham = _responder_runtime(connection)
+        sham_rows_affected = 0
         if sham_level == SHAM_RELOAD.value:
-            _close_with_probe(
+            sham_rows_affected = self._reload_responder(
                 connection,
                 clone_nonce=clone_nonce,
-                runner_resource_id=runner_resource_id,
             )
-            connection = self._fresh_database(
-                clone_nonce=clone_nonce,
-                runner_resource_id=runner_resource_id,
-            )
+        responder_after_sham = _responder_runtime(connection)
+        sham_operation = _record_and_read_sham_operation(
+            connection,
+            operation=(
+                "reload"
+                if sham_level == SHAM_RELOAD.value
+                else "steady-observation"
+            ),
+            before=responder_before_sham,
+            after=responder_after_sham,
+            rows_affected=sham_rows_affected,
+        )
+        _validate_sham_operation(
+            sham_level=sham_level,
+            before=responder_before_sham,
+            after=responder_after_sham,
+            receipt=sham_operation,
+        )
 
         attack_triggered = input_level == ATTACK.value
-        resource_identity = _resource_identity(connection)
+        resource_identity = _resource_identity(
+            connection,
+            requested_clone_nonce=clone_nonce,
+            requested_runner_resource_id=runner_resource_id,
+        )
+        if (
+            resource_identity.observed_clone_nonce != clone_nonce
+            or resource_identity.observed_runner_resource_id != runner_resource_id
+        ):
+            connection.close()
+            raise RuntimeError(
+                "runtime identity readback differs from the requested clone"
+            )
         before_target = _session_states(connection)
         principals_before_target = _principal_states(connection)
         exact_revocation_executed = (
@@ -270,6 +363,46 @@ class FinancialResponseRuntime:
             target_operation = "report-only"
         else:
             target_operation = "not-triggered"
+        expected_status = (
+            ResponseActionStatus.REPORTED_SUCCESS
+            if attack_triggered
+            else ResponseActionStatus.NOT_TRIGGERED
+        )
+        response_action_receipt = _record_and_read_response_action(
+            connection,
+            responder=responder_after_sham,
+            trace_id=trace_id,
+            action_digest=action_digest,
+            target_mode=target_level,
+            operation=target_operation,
+            status=expected_status,
+            rows_affected=target_rows_affected,
+        )
+        if (
+            response_action_receipt.operation_id
+            != _expected_response_action_operation_id(
+                trace_id=trace_id,
+                action_digest=action_digest,
+                target_mode=target_level,
+                responder_instance_id=responder_after_sham.instance_id,
+            )
+            or response_action_receipt.responder_instance_id
+            != responder_after_sham.instance_id
+            or response_action_receipt.trace_id != trace_id
+            or response_action_receipt.action_digest != action_digest
+            or response_action_receipt.target_mode != target_level
+            or response_action_receipt.principal_id
+            != COMPROMISED_PRINCIPAL_ID
+            or response_action_receipt.session_id != COMPROMISED_SESSION_ID
+            or response_action_receipt.operation != target_operation
+            or response_action_receipt.status != expected_status
+            or response_action_receipt.rows_affected != target_rows_affected
+        ):
+            connection.close()
+            raise RuntimeError(
+                "response action readback differs from the executed operation"
+            )
+        status = response_action_receipt.status
         after_target = _session_states(connection)
         principals_after_target = _principal_states(connection)
         target_modified = _changed_session_ids(before_target, after_target)
@@ -342,11 +475,6 @@ class FinancialResponseRuntime:
             runner_resource_id=runner_resource_id,
         )
 
-        status = (
-            ResponseActionStatus.REPORTED_SUCCESS
-            if attack_triggered
-            else ResponseActionStatus.NOT_TRIGGERED
-        )
         events = _events(
             trace_id=trace_id,
             action_digest=action_digest,
@@ -382,6 +510,10 @@ class FinancialResponseRuntime:
             compensator_modified_session_ids=compensator_modified,
             session_readbacks=sessions_after_compensator,
             principal_readbacks=principals_after_compensator_readback,
+            responder_before_sham=responder_before_sham,
+            responder_after_sham=responder_after_sham,
+            sham_operation=sham_operation,
+            response_action_receipt=response_action_receipt,
             sessions_before_target=sessions_before_target,
             sessions_after_target=sessions_after_target,
             sessions_after_compensator=sessions_after_compensator,
@@ -415,6 +547,7 @@ class FinancialResponseRuntime:
         runner_resource_id: str,
     ) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             """
             CREATE TABLE runtime_identity (
@@ -441,6 +574,69 @@ class FinancialResponseRuntime:
                 revoked INTEGER NOT NULL CHECK (revoked IN (0, 1))
             )
             """
+        )
+        connection.execute(
+            """
+            CREATE TABLE responder_runtime (
+                slot TEXT PRIMARY KEY CHECK (slot = 'primary'),
+                clone_nonce TEXT NOT NULL REFERENCES runtime_identity(clone_nonce),
+                instance_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                config_digest TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE responder_sham_operations (
+                operation_id TEXT PRIMARY KEY,
+                operation TEXT NOT NULL
+                    CHECK (operation IN ('steady-observation', 'reload')),
+                clone_nonce TEXT NOT NULL REFERENCES runtime_identity(clone_nonce),
+                before_instance_id TEXT NOT NULL,
+                after_instance_id TEXT NOT NULL,
+                before_generation INTEGER NOT NULL,
+                after_generation INTEGER NOT NULL,
+                config_digest TEXT NOT NULL,
+                rows_affected INTEGER NOT NULL CHECK (rows_affected >= 0)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE response_actions (
+                operation_id TEXT PRIMARY KEY,
+                responder_instance_id TEXT NOT NULL,
+                trace_id TEXT NOT NULL,
+                action_digest TEXT NOT NULL,
+                target_mode TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                operation TEXT NOT NULL
+                    CHECK (
+                        operation IN (
+                            'not-triggered',
+                            'report-only',
+                            'revoke-exact'
+                        )
+                    ),
+                status TEXT NOT NULL
+                    CHECK (status IN ('not-triggered', 'reported-success')),
+                rows_affected INTEGER NOT NULL CHECK (rows_affected >= 0)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO runtime_identity VALUES (?, ?)",
+            (clone_nonce, runner_resource_id),
+        )
+        connection.execute(
+            "INSERT INTO responder_runtime VALUES ('primary', ?, ?, 0, ?)",
+            (
+                clone_nonce,
+                _expected_responder_instance_id(clone_nonce, 0),
+                RESPONDER_CONFIG_DIGEST,
+            ),
         )
         connection.executemany(
             "INSERT INTO principals VALUES (?, ?, ?)",
@@ -472,12 +668,43 @@ class FinancialResponseRuntime:
                 ),
             ),
         )
-        connection.execute(
-            "INSERT INTO runtime_identity VALUES (?, ?)",
-            (clone_nonce, runner_resource_id),
-        )
         connection.commit()
         return connection
+
+    @staticmethod
+    def _reload_responder(
+        connection: sqlite3.Connection,
+        *,
+        clone_nonce: str,
+    ) -> int:
+        """Advance the persisted synthetic responder generation in the same clone."""
+
+        before = _responder_runtime(connection)
+        after_generation = before.generation + 1
+        rows_affected = connection.execute(
+            """
+            UPDATE responder_runtime
+            SET instance_id = ?, generation = ?
+            WHERE slot = 'primary'
+              AND clone_nonce = ?
+              AND instance_id = ?
+              AND generation = ?
+              AND config_digest = ?
+            """,
+            (
+                _expected_responder_instance_id(
+                    clone_nonce,
+                    after_generation,
+                ),
+                after_generation,
+                clone_nonce,
+                before.instance_id,
+                before.generation,
+                before.config_digest,
+            ),
+        ).rowcount
+        connection.commit()
+        return rows_affected
 
 
 def assess_response_case(
@@ -605,7 +832,267 @@ def _principal_readbacks(
     )
 
 
-def _resource_identity(connection: sqlite3.Connection) -> ResourceIdentityReceipt:
+def _expected_responder_instance_id(clone_nonce: str, generation: int) -> str:
+    digest = hashlib.sha256(
+        rfc8785.dumps(
+            {
+                "schema": "assurance-lab.responder-instance-id/v1",
+                "clone_nonce": clone_nonce,
+                "generation": generation,
+                "config_digest": RESPONDER_CONFIG_DIGEST,
+            }
+        )
+    ).hexdigest()
+    return f"response-responder-{digest[:32]}-g{generation}"
+
+
+def _expected_sham_operation_id(
+    operation: Literal["steady-observation", "reload"],
+    before: ResponderRuntimeReadback,
+    after: ResponderRuntimeReadback,
+) -> str:
+    digest = hashlib.sha256(
+        rfc8785.dumps(
+            {
+                "schema": "assurance-lab.responder-sham-operation-id/v1",
+                "operation": operation,
+                "clone_nonce": before.clone_nonce,
+                "before_instance_id": before.instance_id,
+                "after_instance_id": after.instance_id,
+                "before_generation": before.generation,
+                "after_generation": after.generation,
+                "config_digest": before.config_digest,
+            }
+        )
+    ).hexdigest()
+    return f"response-sham-{digest[:32]}"
+
+
+def _responder_runtime(
+    connection: sqlite3.Connection,
+) -> ResponderRuntimeReadback:
+    rows = tuple(
+        connection.execute(
+            """
+            SELECT clone_nonce, instance_id, generation, config_digest
+            FROM responder_runtime
+            WHERE slot = 'primary'
+            """
+        )
+    )
+    if len(rows) != 1:
+        raise RuntimeError("responder runtime table must contain one primary row")
+    clone_nonce, instance_id, generation, config_digest = rows[0]
+    return ResponderRuntimeReadback(
+        clone_nonce=str(clone_nonce),
+        instance_id=str(instance_id),
+        generation=int(generation),
+        config_digest=str(config_digest),
+    )
+
+
+def _record_and_read_sham_operation(
+    connection: sqlite3.Connection,
+    *,
+    operation: Literal["steady-observation", "reload"],
+    before: ResponderRuntimeReadback,
+    after: ResponderRuntimeReadback,
+    rows_affected: int,
+) -> ResponderShamReceipt:
+    operation_id = _expected_sham_operation_id(operation, before, after)
+    connection.execute(
+        """
+        INSERT INTO responder_sham_operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation_id,
+            operation,
+            before.clone_nonce,
+            before.instance_id,
+            after.instance_id,
+            before.generation,
+            after.generation,
+            before.config_digest,
+            rows_affected,
+        ),
+    )
+    connection.commit()
+    rows = tuple(
+        connection.execute(
+            """
+            SELECT operation_id, operation, clone_nonce,
+                   before_instance_id, after_instance_id,
+                   before_generation, after_generation,
+                   config_digest, rows_affected
+            FROM responder_sham_operations
+            ORDER BY operation_id
+            """
+        )
+    )
+    if len(rows) != 1:
+        raise RuntimeError("responder sham operation table must contain one row")
+    row = rows[0]
+    return ResponderShamReceipt(
+        operation_id=str(row[0]),
+        operation=row[1],
+        clone_nonce=str(row[2]),
+        before_instance_id=str(row[3]),
+        after_instance_id=str(row[4]),
+        before_generation=int(row[5]),
+        after_generation=int(row[6]),
+        config_digest=str(row[7]),
+        rows_affected=int(row[8]),
+    )
+
+
+def _validate_sham_operation(
+    *,
+    sham_level: str,
+    before: ResponderRuntimeReadback,
+    after: ResponderRuntimeReadback,
+    receipt: ResponderShamReceipt,
+) -> None:
+    expected_operation: Literal["steady-observation", "reload"] = (
+        "reload" if sham_level == SHAM_RELOAD.value else "steady-observation"
+    )
+    expected_after_generation = (
+        1 if expected_operation == "reload" else 0
+    )
+    expected_rows = 1 if expected_operation == "reload" else 0
+    if (
+        before.clone_nonce != after.clone_nonce
+        or before.generation != 0
+        or after.generation != expected_after_generation
+        or before.config_digest != RESPONDER_CONFIG_DIGEST
+        or after.config_digest != RESPONDER_CONFIG_DIGEST
+        or before.instance_id
+        != _expected_responder_instance_id(before.clone_nonce, 0)
+        or after.instance_id
+        != _expected_responder_instance_id(
+            before.clone_nonce,
+            expected_after_generation,
+        )
+        or receipt.operation
+        != expected_operation
+        or receipt.operation_id
+        != _expected_sham_operation_id(expected_operation, before, after)
+        or receipt.clone_nonce != before.clone_nonce
+        or receipt.before_instance_id != before.instance_id
+        or receipt.after_instance_id != after.instance_id
+        or receipt.before_generation != before.generation
+        or receipt.after_generation != after.generation
+        or receipt.config_digest != before.config_digest
+        or receipt.rows_affected != expected_rows
+    ):
+        raise RuntimeError(
+            "responder sham operation differs from its persisted state transition"
+        )
+
+
+def _expected_response_action_operation_id(
+    *,
+    trace_id: str,
+    action_digest: str,
+    target_mode: str,
+    responder_instance_id: str,
+) -> str:
+    digest = hashlib.sha256(
+        rfc8785.dumps(
+            {
+                "schema": "assurance-lab.response-action-operation-id/v1",
+                "trace_id": trace_id,
+                "action_digest": action_digest,
+                "target_mode": target_mode,
+                "responder_instance_id": responder_instance_id,
+            }
+        )
+    ).hexdigest()
+    return f"response-action-{digest[:32]}"
+
+
+def _record_and_read_response_action(
+    connection: sqlite3.Connection,
+    *,
+    responder: ResponderRuntimeReadback,
+    trace_id: str,
+    action_digest: str,
+    target_mode: str,
+    operation: Literal["not-triggered", "report-only", "revoke-exact"],
+    status: ResponseActionStatus,
+    rows_affected: int,
+) -> ResponseActionReceipt:
+    operation_id = _expected_response_action_operation_id(
+        trace_id=trace_id,
+        action_digest=action_digest,
+        target_mode=target_mode,
+        responder_instance_id=responder.instance_id,
+    )
+    connection.execute(
+        """
+        INSERT INTO response_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation_id,
+            responder.instance_id,
+            trace_id,
+            action_digest,
+            target_mode,
+            COMPROMISED_PRINCIPAL_ID,
+            COMPROMISED_SESSION_ID,
+            operation,
+            status.value,
+            rows_affected,
+        ),
+    )
+    connection.commit()
+    rows = tuple(
+        connection.execute(
+            """
+            SELECT operation_id, responder_instance_id, trace_id,
+                   action_digest, target_mode, principal_id, session_id,
+                   operation, status, rows_affected
+            FROM response_actions
+            ORDER BY operation_id
+            """
+        )
+    )
+    if len(rows) != 1:
+        raise RuntimeError("response action table must contain exactly one row")
+    row = rows[0]
+    operation_value = str(row[7])
+    if operation_value not in {
+        "not-triggered",
+        "report-only",
+        "revoke-exact",
+    }:
+        raise RuntimeError("response action row has an unknown operation")
+    try:
+        status_value = ResponseActionStatus(str(row[8]))
+    except ValueError as error:
+        raise RuntimeError("response action row has an unknown status") from error
+    return ResponseActionReceipt(
+        operation_id=str(row[0]),
+        responder_instance_id=str(row[1]),
+        trace_id=str(row[2]),
+        action_digest=str(row[3]),
+        target_mode=str(row[4]),
+        principal_id=str(row[5]),
+        session_id=str(row[6]),
+        operation=cast(
+            Literal["not-triggered", "report-only", "revoke-exact"],
+            operation_value,
+        ),
+        status=status_value,
+        rows_affected=int(row[9]),
+    )
+
+
+def _resource_identity(
+    connection: sqlite3.Connection,
+    *,
+    requested_clone_nonce: str,
+    requested_runner_resource_id: str,
+) -> ResourceIdentityReceipt:
     rows = tuple(
         connection.execute(
             """
@@ -619,8 +1106,8 @@ def _resource_identity(connection: sqlite3.Connection) -> ResourceIdentityReceip
         raise RuntimeError("runtime identity table must contain exactly one row")
     clone_nonce, runner_resource_id = rows[0]
     return ResourceIdentityReceipt(
-        requested_clone_nonce=str(clone_nonce),
-        requested_runner_resource_id=str(runner_resource_id),
+        requested_clone_nonce=requested_clone_nonce,
+        requested_runner_resource_id=requested_runner_resource_id,
         observed_clone_nonce=str(clone_nonce),
         observed_runner_resource_id=str(runner_resource_id),
     )

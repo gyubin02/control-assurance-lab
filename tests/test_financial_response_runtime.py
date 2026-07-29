@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from assurance_lab.contract import (
     BooleanValue,
     CellSelector,
+    CompiledExperiment,
     EvidencePolicyRef,
     EvidenceWindow,
     ExperimentScope,
@@ -36,6 +38,7 @@ from assurance_lab.scenarios.financial_response_contract import (
     build_financial_response_contract,
 )
 from assurance_lab.scenarios.financial_response_runtime import (
+    RESPONDER_CONFIG_DIGEST,
     BaselineVerdict,
     FinancialResponseRuntime,
     ResponseActionStatus,
@@ -63,7 +66,7 @@ def _selector(
     )
 
 
-def _compiled():
+def _compiled() -> CompiledExperiment:
     start = datetime(2026, 7, 29, 0, 0, tzinfo=UTC)
     scope = ExperimentScope(
         scenario_id=SCENARIO_ID,
@@ -340,6 +343,116 @@ def test_responder_reload_is_a_behavior_free_sham(
     )
 
 
+def test_responder_reload_has_a_persisted_pre_post_operation_receipt() -> None:
+    runtime = FinancialResponseRuntime()
+    steady = runtime.execute(
+        _selector(
+            attack=True,
+            target_effective=False,
+            quarantine_on=False,
+        ),
+        trace_id="steady-operation-receipt",
+        clone_nonce="steady-operation-clone",
+    )
+    reloaded = runtime.execute(
+        _selector(
+            attack=True,
+            target_effective=False,
+            quarantine_on=False,
+            sham_reload=True,
+        ),
+        trace_id="reload-operation-receipt",
+        clone_nonce="reload-operation-clone",
+    )
+
+    assert steady.sham_operation.operation == "steady-observation"
+    assert steady.sham_operation.rows_affected == 0
+    assert steady.responder_before_sham == steady.responder_after_sham
+    assert reloaded.sham_operation.operation == "reload"
+    assert reloaded.sham_operation.rows_affected == 1
+    assert (
+        reloaded.responder_after_sham.generation
+        == reloaded.responder_before_sham.generation + 1
+    )
+    assert (
+        reloaded.responder_after_sham.instance_id
+        != reloaded.responder_before_sham.instance_id
+    )
+    assert (
+        reloaded.responder_after_sham.config_digest
+        == reloaded.responder_before_sham.config_digest
+        == reloaded.sham_operation.config_digest
+        == RESPONDER_CONFIG_DIGEST
+    )
+    assert (
+        reloaded.responder_after_sham.clone_nonce
+        == reloaded.resource_identity.observed_clone_nonce
+        == "reload-operation-clone"
+    )
+
+
+def test_no_op_responder_reload_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FinancialResponseRuntime()
+
+    def no_op_reload(
+        _connection: object,
+        *,
+        clone_nonce: str,
+    ) -> int:
+        assert clone_nonce == "no-op-reload-clone"
+        return 0
+
+    monkeypatch.setattr(runtime, "_reload_responder", no_op_reload)
+    with pytest.raises(RuntimeError, match="sham operation"):
+        runtime.execute(
+            _selector(
+                attack=True,
+                target_effective=False,
+                quarantine_on=False,
+                sham_reload=True,
+            ),
+            trace_id="no-op-reload",
+            clone_nonce="no-op-reload-clone",
+        )
+
+
+def test_relabelled_runtime_resource_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = FinancialResponseRuntime()
+    original = runtime._fresh_database
+
+    def relabelled_database(
+        *,
+        clone_nonce: str,
+        runner_resource_id: str,
+    ) -> sqlite3.Connection:
+        connection = original(
+            clone_nonce=clone_nonce,
+            runner_resource_id=runner_resource_id,
+        )
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            "UPDATE runtime_identity SET clone_nonce = 'forged-clone-label'"
+        )
+        connection.commit()
+        return connection
+
+    monkeypatch.setattr(runtime, "_fresh_database", relabelled_database)
+    with pytest.raises(RuntimeError, match="runtime identity readback"):
+        runtime.execute(
+            _selector(
+                attack=True,
+                target_effective=False,
+                quarantine_on=False,
+            ),
+            trace_id="resource-relabel",
+            clone_nonce="requested-clone-label",
+        )
+
+
 def test_revoke_exact_touches_only_the_compromised_old_session() -> None:
     result = FinancialResponseRuntime().execute(
         _selector(
@@ -406,6 +519,18 @@ def test_events_expose_status_and_each_independent_readback() -> None:
         target_event.value("response_action_status")
         == ResponseActionStatus.REPORTED_SUCCESS.value
     )
+    assert (
+        result.response_action_receipt.status
+        == ResponseActionStatus.REPORTED_SUCCESS
+    )
+    assert (
+        result.response_action_receipt.responder_instance_id
+        == result.responder_after_sham.instance_id
+    )
+    assert result.response_action_receipt.action_digest == ATTACK_ACTION_DIGEST
+    assert result.response_action_receipt.trace_id == result.trace_id
+    assert result.response_action_receipt.operation == "report-only"
+    assert result.response_action_receipt.rows_affected == 0
     assert target_event.value("compromised_session_active") is True
     assert target_event.value("non_target_sessions_active") is True
     assert target_event.value("target_principal_id") == COMPROMISED_PRINCIPAL_ID

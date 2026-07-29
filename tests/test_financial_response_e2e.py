@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,13 @@ from typing import Any
 import pytest
 
 from assurance_lab.contract import Stage, TrialPlan, compile_experiment
-from assurance_lab.evaluation import ResidualClassification, TruthValue
+from assurance_lab.evaluation import (
+    CleanupBinding,
+    EvidenceBinding,
+    ResidualClassification,
+    TrialRecord,
+    TruthValue,
+)
 from assurance_lab.evidence.bundle import (
     BundleStatus,
     EvaluationRef,
@@ -26,6 +33,9 @@ from assurance_lab.evidence.writer import BundleMetadata, PayloadFile, write_bun
 from assurance_lab.scenarios.financial_response_contract import (
     ATTACK,
     BENIGN,
+    COMPENSATOR_OFF,
+    SHAM_RELOAD,
+    SHAM_STEADY,
     TARGET_EFFECTIVE,
     build_financial_response_contract,
 )
@@ -38,7 +48,10 @@ from assurance_lab.scenarios.financial_response_e2e import (
 )
 from assurance_lab.scenarios.financial_response_runtime import (
     BaselineVerdict,
+    ResponderRuntimeReadback,
     ResponseResidualClassification,
+    _expected_responder_instance_id,
+    _expected_sham_operation_id,
 )
 
 
@@ -100,6 +113,92 @@ def _set_payload(event: dict[str, Any], name: str, value: object) -> None:
     item = payload[_payload_index(event, name)]
     assert isinstance(item, dict)
     item["value"] = value
+
+
+_CHAIN_PATHS = {
+    "runtime": "records/runtime-observations.jsonl",
+    "stage": "records/stage-events.jsonl",
+    "metric": "records/metric-observations.jsonl",
+    "attestation": "artifacts/trial-attestations.jsonl",
+    "cleanup": "artifacts/cleanup-observations.jsonl",
+    "trial": "records/trial-records.jsonl",
+}
+
+
+def _load_trial_chain(source: Path) -> dict[str, list[Any]]:
+    return {
+        name: strict_jsonl_loads(
+            (source / path).read_bytes(),
+            require_sorted_ids=True,
+        )
+        for name, path in _CHAIN_PATHS.items()
+    }
+
+
+def _rewrite_trial_chain(
+    source: Path,
+    destination: Path,
+    values: dict[str, list[Any]],
+) -> None:
+    _rewrite_bundle(
+        source,
+        destination,
+        replacements={
+            _CHAIN_PATHS[name]: canonical_jsonl_bytes(records)
+            for name, records in values.items()
+        },
+    )
+
+
+def _coherently_rebind_trial_chain(
+    values: dict[str, list[Any]],
+    *,
+    trial_key: str,
+) -> None:
+    """Rehash every downstream edge after changing one raw observation."""
+
+    runtime = next(
+        item for item in values["runtime"] if item["trial_key"] == trial_key
+    )
+    runtime_digest = (
+        f"sha256:{hashlib.sha256(canonical_json_bytes(runtime)).hexdigest()}"
+    )
+    stage_digests: dict[str, str] = {}
+    for stage in values["stage"]:
+        if stage["trial_key"] != trial_key:
+            continue
+        stage["runtime_observation_digest"] = runtime_digest
+        stage_digests[str(stage["stage"])] = (
+            f"sha256:{hashlib.sha256(canonical_json_bytes(stage)).hexdigest()}"
+        )
+    for metric in values["metric"]:
+        if metric["trial_key"] == trial_key:
+            metric["event_digest"] = stage_digests[str(metric["stage"])]
+
+    attestation = next(
+        item for item in values["attestation"] if item["trial_key"] == trial_key
+    )
+    attestation["runtime_observation_digest"] = runtime_digest
+    attestation_digest = (
+        f"sha256:{hashlib.sha256(canonical_json_bytes(attestation)).hexdigest()}"
+    )
+    cleanup = next(
+        item for item in values["cleanup"] if item["trial_key"] == trial_key
+    )
+    cleanup["runtime_observation_digest"] = runtime_digest
+    cleanup_digest = (
+        f"sha256:{hashlib.sha256(canonical_json_bytes(cleanup)).hexdigest()}"
+    )
+    stored = next(
+        item
+        for item in values["trial"]
+        if item["record"]["trial_key"] == trial_key
+    )
+    stored["record"]["clone"]["attestation_bundle_digest"] = attestation_digest
+    stored["record"]["cleanup"]["evidence_bundle_digest"] = cleanup_digest
+    trace = stored["record"]["trace"]
+    for stage_name, digest in stage_digests.items():
+        trace[stage_name]["evidence_bundle_digest"] = digest
 
 
 def test_response_bundle_recomputes_masked_revocation_from_raw_evidence(
@@ -210,6 +309,25 @@ def test_response_bundle_recomputes_masked_revocation_from_raw_evidence(
         == item["resource_identity"]["observed_clone_nonce"]
         for item in runtime_lines
     )
+    selector_by_trial = {
+        trial.key: selectors[trial.cell_key]
+        for trial in compiled.planned_trials
+    }
+    for item in runtime_lines:
+        selector = selector_by_trial[item["trial_key"]]
+        before = item["responder_before_sham"]
+        after = item["responder_after_sham"]
+        operation = item["sham_operation"]
+        if selector.sham == SHAM_RELOAD:
+            assert operation["operation"] == "reload"
+            assert operation["rows_affected"] == 1
+            assert after["generation"] == before["generation"] + 1
+            assert after["instance_id"] != before["instance_id"]
+        else:
+            assert selector.sham == SHAM_STEADY
+            assert operation["operation"] == "steady-observation"
+            assert operation["rows_affected"] == 0
+            assert after == before
     assert all(
         item["probe_error_type"] == "sqlite3.ProgrammingError"
         and item["closed_handle_rejected_operation"] is True
@@ -221,7 +339,10 @@ def test_response_bundle_recomputes_masked_revocation_from_raw_evidence(
     assert source_set["schema"] == (
         "assurance-lab.financial-response-source-set/v1"
     )
-    assert len(source_set["files"]) == 8
+    assert source_set["dependency_resolver"] == (
+        "python-ast-local-import-closure/v1"
+    )
+    assert len(source_set["files"]) == 11
     assert f"sha256:{hashlib.sha256(source_set_bytes).hexdigest()}" == (
         compiled.contract.scope.build_digest
     )
@@ -452,6 +573,28 @@ def test_claimed_source_set_cannot_be_rebound_by_rehashing_the_manifest(
         FinancialResponseBundleRepository(destination)
 
 
+def test_responder_config_descriptor_cannot_be_rebound(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    write_reference_financial_response_bundle(source)
+    path = "spec/responder-config.json"
+    config = strict_json_loads((source / path).read_bytes())
+    assert isinstance(config, dict)
+    config["attack_status"] = "not-triggered"
+    destination = tmp_path / "rewritten-responder-config"
+    _rewrite_bundle(
+        source,
+        destination,
+        replacements={path: canonical_json_bytes(config)},
+    )
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match="responder configuration",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
 def test_manifest_provenance_is_not_rebindable(
     tmp_path: Path,
 ) -> None:
@@ -543,21 +686,7 @@ def test_coordinated_runtime_receipt_rebinding_is_rejected(
         for trial in compiled.planned_trials
         if selectors[trial.cell_key] == compiled.current_selector
     )
-    paths = {
-        "runtime": "records/runtime-observations.jsonl",
-        "stage": "records/stage-events.jsonl",
-        "metric": "records/metric-observations.jsonl",
-        "attestation": "artifacts/trial-attestations.jsonl",
-        "cleanup": "artifacts/cleanup-observations.jsonl",
-        "trial": "records/trial-records.jsonl",
-    }
-    values = {
-        name: strict_jsonl_loads(
-            (source / path).read_bytes(),
-            require_sorted_ids=True,
-        )
-        for name, path in paths.items()
-    }
+    values = _load_trial_chain(source)
 
     runtime = next(
         item for item in values["runtime"] if item["trial_key"] == current.key
@@ -611,16 +740,382 @@ def test_coordinated_runtime_receipt_rebinding_is_rejected(
         trace[stage_name]["evidence_bundle_digest"] = digest
 
     destination = tmp_path / "coordinated-rebind"
-    _rewrite_bundle(
-        source,
-        destination,
-        replacements={
-            paths[name]: canonical_jsonl_bytes(records)
-            for name, records in values.items()
-        },
-    )
+    _rewrite_trial_chain(source, destination, values)
     with pytest.raises(
         FinancialResponseBundleError,
         match="gateway query receipt differs",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
+def test_coherent_response_status_rewrite_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A rewriter cannot turn the fixed responder's success row into failure."""
+
+    source = tmp_path / "source"
+    compiled, _ = write_reference_financial_response_bundle(source)
+    selectors = {cell.key: cell.selector for cell in compiled.cells}
+    current = next(
+        trial
+        for trial in compiled.planned_trials
+        if selectors[trial.cell_key] == compiled.current_selector
+    )
+    values = _load_trial_chain(source)
+    runtime = next(
+        item
+        for item in values["runtime"]
+        if item["trial_key"] == current.key
+    )
+    runtime["response_action"]["status"] = "reported-failure"
+    target = next(
+        item
+        for item in values["stage"]
+        if item["trial_key"] == current.key and item["stage"] == "target"
+    )
+    _set_payload(target, "response_action_status", "reported-failure")
+    _set_payload(target, "response_action_reported_success", False)
+    status_metric = next(
+        item
+        for item in values["metric"]
+        if item["trial_key"] == current.key
+        and item["metric_id"] == "response-action-reported-success"
+    )
+    status_metric["value"]["value"] = False
+    _coherently_rebind_trial_chain(values, trial_key=current.key)
+
+    destination = tmp_path / "coherent-status-rewrite"
+    _rewrite_trial_chain(source, destination, values)
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match=r"response_action|response status|runtime observation",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
+def test_coherent_raw_rows_and_mutation_receipt_rewrite_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Rehashing every derived layer cannot invent a failed fixed mutation."""
+
+    source = tmp_path / "source"
+    compiled, _ = write_reference_financial_response_bundle(source)
+    selectors = {cell.key: cell.selector for cell in compiled.cells}
+    trial = next(
+        item
+        for item in compiled.planned_trials
+        if selectors[item.cell_key].input == ATTACK
+        and selectors[item.cell_key].target == TARGET_EFFECTIVE
+        and selectors[item.cell_key].compensator == COMPENSATOR_OFF
+        and selectors[item.cell_key].sham == SHAM_STEADY
+    )
+    values = _load_trial_chain(source)
+    runtime = next(
+        item for item in values["runtime"] if item["trial_key"] == trial.key
+    )
+    for snapshot_name in (
+        "sessions_after_target",
+        "sessions_after_compensator",
+    ):
+        compromised = next(
+            row
+            for row in runtime[snapshot_name]
+            if row["session_id"] == "SYNTH-SESSION-SUPPORT-017-OLD"
+        )
+        compromised["active"] = True
+    runtime["target_mutation"]["rows_affected"] = 0
+    runtime["response_action"]["rows_affected"] = 0
+    replay = next(
+        item
+        for item in runtime["gateway_decisions"]
+        if item["query_id"] == "probe-compromised-session-replay"
+    )
+    replay["session_revoked"] = False
+    replay["principal_quarantined"] = False
+    replay["available"] = True
+
+    empty_set = {
+        "schema": "assurance-lab.modified-session-set/v1",
+        "session_ids": [],
+    }
+    empty_canonical = canonical_json_bytes(empty_set)
+    target = next(
+        item
+        for item in values["stage"]
+        if item["trial_key"] == trial.key and item["stage"] == "target"
+    )
+    _set_payload(target, "compromised_session_active", True)
+    _set_payload(target, "target_modified_session_count", 0)
+    _set_payload(
+        target,
+        "target_modified_session_ids_canonical",
+        empty_canonical.decode("utf-8"),
+    )
+    _set_payload(
+        target,
+        "target_modified_session_ids_digest",
+        f"sha256:{hashlib.sha256(empty_canonical).hexdigest()}",
+    )
+    outcome = next(
+        item
+        for item in values["stage"]
+        if item["trial_key"] == trial.key and item["stage"] == "outcome"
+    )
+    _set_payload(outcome, "compromised_session_replay_denied", False)
+    for metric_id, value in (
+        ("compromised-session-active", True),
+        ("compromised-session-replay-denied", False),
+    ):
+        metric = next(
+            item
+            for item in values["metric"]
+            if item["trial_key"] == trial.key
+            and item["metric_id"] == metric_id
+        )
+        metric["value"]["value"] = value
+    _coherently_rebind_trial_chain(values, trial_key=trial.key)
+
+    destination = tmp_path / "coherent-mutation-rewrite"
+    _rewrite_trial_chain(source, destination, values)
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match=r"fixed response transitions|mutation row count",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
+def test_coherent_reload_to_steady_receipt_relabel_is_rejected(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    compiled, _ = write_reference_financial_response_bundle(source)
+    selectors = {cell.key: cell.selector for cell in compiled.cells}
+    trial = next(
+        item
+        for item in compiled.planned_trials
+        if selectors[item.cell_key].sham == SHAM_RELOAD
+    )
+    values = _load_trial_chain(source)
+    runtime = next(
+        item for item in values["runtime"] if item["trial_key"] == trial.key
+    )
+    before = deepcopy(runtime["responder_before_sham"])
+    runtime["responder_after_sham"] = deepcopy(before)
+    before_readback = ResponderRuntimeReadback(**before)
+    runtime["sham_operation"] = {
+        "operation_id": _expected_sham_operation_id(
+            "steady-observation",
+            before_readback,
+            before_readback,
+        ),
+        "operation": "steady-observation",
+        "clone_nonce": before["clone_nonce"],
+        "before_instance_id": before["instance_id"],
+        "after_instance_id": before["instance_id"],
+        "before_generation": before["generation"],
+        "after_generation": before["generation"],
+        "config_digest": before["config_digest"],
+        "rows_affected": 0,
+    }
+    _coherently_rebind_trial_chain(values, trial_key=trial.key)
+
+    destination = tmp_path / "coherent-reload-relabel"
+    _rewrite_trial_chain(source, destination, values)
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match="responder configuration",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
+def test_coherent_responder_config_rebinding_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A stable-looking reload cannot substitute an arbitrary configuration."""
+
+    source = tmp_path / "source"
+    compiled, _ = write_reference_financial_response_bundle(source)
+    selectors = {cell.key: cell.selector for cell in compiled.cells}
+    trial = next(
+        item
+        for item in compiled.planned_trials
+        if selectors[item.cell_key].sham == SHAM_RELOAD
+    )
+    values = _load_trial_chain(source)
+    runtime = next(
+        item for item in values["runtime"] if item["trial_key"] == trial.key
+    )
+    forged_digest = f"sha256:{'a' * 64}"
+    runtime["responder_before_sham"]["config_digest"] = forged_digest
+    runtime["responder_after_sham"]["config_digest"] = forged_digest
+    runtime["sham_operation"]["config_digest"] = forged_digest
+    before = ResponderRuntimeReadback(**runtime["responder_before_sham"])
+    after = ResponderRuntimeReadback(**runtime["responder_after_sham"])
+    runtime["sham_operation"]["operation_id"] = _expected_sham_operation_id(
+        "reload",
+        before,
+        after,
+    )
+    _coherently_rebind_trial_chain(values, trial_key=trial.key)
+
+    destination = tmp_path / "coherent-config-rebind"
+    _rewrite_trial_chain(source, destination, values)
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match="responder configuration",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
+def test_coherent_clone_identity_relabel_is_rejected(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    compiled, _ = write_reference_financial_response_bundle(source)
+    selectors = {cell.key: cell.selector for cell in compiled.cells}
+    trial = next(
+        item
+        for item in compiled.planned_trials
+        if selectors[item.cell_key].sham == SHAM_STEADY
+    )
+    values = _load_trial_chain(source)
+    new_clone_id = "coherently-relabelled-clone"
+    runtime = next(
+        item for item in values["runtime"] if item["trial_key"] == trial.key
+    )
+    resource = runtime["resource_identity"]
+    resource["requested_clone_nonce"] = new_clone_id
+    resource["observed_clone_nonce"] = new_clone_id
+    config_digest = runtime["responder_before_sham"]["config_digest"]
+    instance_id = _expected_responder_instance_id(new_clone_id, 0)
+    runtime["responder_before_sham"] = {
+        "clone_nonce": new_clone_id,
+        "instance_id": instance_id,
+        "generation": 0,
+        "config_digest": config_digest,
+    }
+    runtime["responder_after_sham"] = deepcopy(
+        runtime["responder_before_sham"]
+    )
+    readback = ResponderRuntimeReadback(
+        clone_nonce=new_clone_id,
+        instance_id=instance_id,
+        generation=0,
+        config_digest=config_digest,
+    )
+    runtime["sham_operation"] = {
+        "operation_id": _expected_sham_operation_id(
+            "steady-observation",
+            readback,
+            readback,
+        ),
+        "operation": "steady-observation",
+        "clone_nonce": new_clone_id,
+        "before_instance_id": instance_id,
+        "after_instance_id": instance_id,
+        "before_generation": 0,
+        "after_generation": 0,
+        "config_digest": config_digest,
+        "rows_affected": 0,
+    }
+    attestation = next(
+        item
+        for item in values["attestation"]
+        if item["trial_key"] == trial.key
+    )
+    cleanup = next(
+        item for item in values["cleanup"] if item["trial_key"] == trial.key
+    )
+    stored = next(
+        item
+        for item in values["trial"]
+        if item["record"]["trial_key"] == trial.key
+    )
+    attestation["clone_unique_instance_id"] = new_clone_id
+    cleanup["clone_unique_instance_id"] = new_clone_id
+    stored["record"]["clone"]["unique_instance_id"] = new_clone_id
+    _coherently_rebind_trial_chain(values, trial_key=trial.key)
+
+    destination = tmp_path / "coherent-clone-relabel"
+    _rewrite_trial_chain(source, destination, values)
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match="compiler plan",
+    ):
+        FinancialResponseBundleRepository(destination)
+
+
+def test_missing_verifier_requests_return_typed_failures(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    write_reference_financial_response_bundle(source)
+    repository = FinancialResponseBundleRepository(source)
+    record = repository.trial_records[0]
+    missing_digest = f"sha256:{'f' * 64}"
+    missing_trial_data = record.model_dump(mode="python", round_trip=True)
+    missing_trial_data["trial_key"] = missing_digest
+    missing_trial = TrialRecord.model_validate(missing_trial_data, strict=True)
+
+    attestation = repository.verify(missing_trial)
+    metric = repository.verify(
+        EvidenceBinding(
+            spec_digest=record.spec_digest,
+            trial_key=record.trial_key,
+            trace_id=record.trace.trace_id,
+            event_id=record.trace.input.event_id,
+            evidence_bundle_digest=(
+                record.trace.input.evidence_bundle_digest
+            ),
+            stage=Stage.INPUT,
+            metric_id="missing-response-metric",
+        )
+    )
+    cleanup = repository.verify(
+        CleanupBinding(
+            spec_digest=record.spec_digest,
+            trial_key=record.trial_key,
+            trace_id=record.trace.trace_id,
+            clone_unique_instance_id=record.clone.unique_instance_id,
+            runner_resource_id=record.clone.runner_resource_id,
+            evidence_bundle_digest=missing_digest,
+            outcome_ended_at=record.trace.outcome.ended_at,
+        )
+    )
+
+    assert attestation.status == "missing"
+    assert metric.status == "missing"
+    assert cleanup.status == "missing"
+
+
+@pytest.mark.parametrize("orphan", (False, True))
+def test_missing_or_orphan_raw_observation_is_domain_rejected(
+    tmp_path: Path,
+    orphan: bool,
+) -> None:
+    source = tmp_path / "source"
+    write_reference_financial_response_bundle(source)
+    path = "records/runtime-observations.jsonl"
+    observations = strict_jsonl_loads(
+        (source / path).read_bytes(),
+        require_sorted_ids=True,
+    )
+    if orphan:
+        extra = deepcopy(observations[0])
+        extra["id"] = "orphan-runtime-observation"
+        extra["trial_key"] = f"sha256:{'e' * 64}"
+        observations.append(extra)
+    else:
+        observations.pop()
+    destination = tmp_path / ("orphan" if orphan else "missing")
+    _rewrite_bundle(
+        source,
+        destination,
+        replacements={path: canonical_jsonl_bytes(observations)},
+    )
+
+    with pytest.raises(
+        FinancialResponseBundleError,
+        match="runtime observations do not exactly cover",
     ):
         FinancialResponseBundleRepository(destination)
