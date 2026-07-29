@@ -18,6 +18,11 @@ from assurance_lab.contract import (
 )
 from assurance_lab.evidence.canonical import canonical_json_bytes
 from assurance_lab.exhibit import FinancialSupportCaseResult, recompute_case
+from assurance_lab.offline_cli import (
+    run_cab_snapshot_create,
+    run_cab_snapshot_verify,
+    run_dsse_verify,
+)
 from assurance_lab.scenarios.financial_data import DatasetProfile, generate_dataset
 from assurance_lab.scenarios.financial_support_contract import (
     SCENARIO_ID,
@@ -51,6 +56,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
     try:
+        if arguments.command == "dsse":
+            return run_dsse_verify(
+                envelope_path=Path(arguments.envelope),
+                policy_path=Path(arguments.policy),
+                payload_path=Path(arguments.payload),
+                payload_type=arguments.payload_type,
+                admission_time=arguments.admission_time,
+                json_output=arguments.json,
+            )
+        if arguments.command == "cab":
+            if arguments.snapshot_command == "create":
+                return run_cab_snapshot_create(
+                    source=Path(arguments.source),
+                    output=Path(arguments.output),
+                )
+            return run_cab_snapshot_verify(
+                snapshot_path=Path(arguments.snapshot),
+                json_output=arguments.json,
+            )
         if arguments.command == "run":
             result = _run(Path(arguments.directory))
             _print_human(result)
@@ -74,6 +98,42 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="verify and recompute an evidence bundle")
     verify.add_argument("directory")
     verify.add_argument("--json", action="store_true", help="emit canonical JSON")
+
+    dsse = commands.add_parser("dsse", help="offline DSSE operations")
+    dsse_commands = dsse.add_subparsers(dest="dsse_command", required=True)
+    dsse_verify = dsse_commands.add_parser(
+        "verify",
+        help="verify exact expected bytes under an external trust policy",
+    )
+    dsse_verify.add_argument("--envelope", required=True)
+    dsse_verify.add_argument("--policy", required=True)
+    dsse_verify.add_argument("--payload", required=True)
+    dsse_verify.add_argument("--payload-type", required=True)
+    dsse_verify.add_argument(
+        "--at",
+        dest="admission_time",
+        required=True,
+        metavar="RFC3339",
+        help="caller-trusted verification instant",
+    )
+    dsse_verify.add_argument("--json", action="store_true", help="emit canonical JSON")
+
+    cab = commands.add_parser("cab", help="offline CAB operations")
+    cab_commands = cab.add_subparsers(dest="cab_command", required=True)
+    snapshot = cab_commands.add_parser("snapshot", help="seal or verify exact CAB bytes")
+    snapshot_commands = snapshot.add_subparsers(dest="snapshot_command", required=True)
+    snapshot_create = snapshot_commands.add_parser(
+        "create",
+        help="capture and self-verify a CAB directory",
+    )
+    snapshot_create.add_argument("source")
+    snapshot_create.add_argument("--out", dest="output", required=True)
+    snapshot_verify = snapshot_commands.add_parser(
+        "verify",
+        help="verify a sealed CAB snapshot",
+    )
+    snapshot_verify.add_argument("snapshot")
+    snapshot_verify.add_argument("--json", action="store_true", help="emit canonical JSON")
     return parser
 
 
