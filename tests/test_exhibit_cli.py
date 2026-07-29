@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from assurance_lab._version import __version__
 from assurance_lab.baseline import BaselineVerdict
 from assurance_lab.cli import main
 from assurance_lab.contract import BooleanValue, IntegerValue, Stage
@@ -158,3 +159,13 @@ def test_checked_in_case_view_is_exactly_recomputed_from_the_example_bundle() ->
     checked_in = (repository_root / "web" / "case.json").read_bytes()
 
     assert canonical_json_bytes(result.model_dump(mode="json")) == checked_in
+
+
+def test_cli_reports_the_installed_package_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--version"])
+
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == f"assurance-lab {__version__}\n"

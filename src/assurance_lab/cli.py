@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from assurance_lab._version import __version__
 from assurance_lab.admission_cli import add_admission_parser, run_admission
 from assurance_lab.contract import (
     EvidencePolicyRef,
@@ -95,6 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="assurance-lab")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="create the fixed simulated evidence bundle")
     run.add_argument("directory")
