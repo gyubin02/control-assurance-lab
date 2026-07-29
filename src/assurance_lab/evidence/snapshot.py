@@ -10,9 +10,10 @@ The format is intentionally boring and non-extensible:
 
 ``magic | file-count:u32 | repeated(path-len:u16 | path | size:u64 | bytes)``
 
-Entries are strictly sorted portable ASCII paths.  There are no timestamps,
-owners, compression codecs, links, or optional headers whose interpretation
-could vary between readers.
+``bundle.json`` is always first; the remaining entries are strictly sorted
+portable ASCII payload paths.  There are no timestamps, owners, compression
+codecs, links, or optional headers whose interpretation could vary between
+readers.
 """
 
 from __future__ import annotations
@@ -150,12 +151,17 @@ def _validate_snapshot_path(path: str) -> None:
 
 
 def _encode(entries: tuple[tuple[str, bytes], ...], *, maximum: int) -> bytes:
-    if not entries or len(entries) > MAX_CAB_SNAPSHOT_FILES:
+    if type(entries) is not tuple or not entries or len(entries) > MAX_CAB_SNAPSHOT_FILES:
         raise CABSnapshotError("snapshot file count is outside the supported range")
     output = bytearray(_MAGIC)
     output.extend(_HEADER.pack(len(entries)))
     previous_payload_path = ""
-    for index, (path, content) in enumerate(entries):
+    for index, entry in enumerate(entries):
+        if type(entry) is not tuple or len(entry) != 2:
+            raise CABSnapshotError("snapshot entries must be exact path/content pairs")
+        path, content = entry
+        if type(path) is not str or type(content) is not bytes:
+            raise CABSnapshotError("snapshot entries require text paths and immutable bytes")
         _validate_snapshot_path(path)
         if index == 0:
             if path != "bundle.json":
@@ -234,6 +240,30 @@ def _decode(snapshot_bytes: bytes, *, maximum: int) -> tuple[tuple[str, bytes], 
     return tuple(entries)
 
 
+def encode_cab_snapshot_entries(
+    entries: tuple[tuple[str, bytes], ...],
+    *,
+    maximum: int = MAX_CAB_SNAPSHOT_BYTES,
+) -> bytes:
+    """Encode exact CAB members using the one canonical snapshot wire codec."""
+
+    if type(maximum) is not int or maximum < 1024 or maximum > MAX_CAB_SNAPSHOT_BYTES:
+        raise CABSnapshotError("CAB snapshot limit is outside the supported profile")
+    return _encode(entries, maximum=maximum)
+
+
+def decode_cab_snapshot_entries(
+    snapshot_bytes: bytes,
+    *,
+    maximum: int = MAX_CAB_SNAPSHOT_BYTES,
+) -> tuple[tuple[str, bytes], ...]:
+    """Decode exact CAB members using the one canonical snapshot wire codec."""
+
+    if type(maximum) is not int or maximum < 1024 or maximum > MAX_CAB_SNAPSHOT_BYTES:
+        raise CABSnapshotError("CAB snapshot limit is outside the supported profile")
+    return _decode(snapshot_bytes, maximum=maximum)
+
+
 def _write_snapshot_tree(root: Path, entries: tuple[tuple[str, bytes], ...]) -> None:
     for relative_path, content in entries:
         components = relative_path.split("/")
@@ -266,7 +296,7 @@ def verify_cab_snapshot(
 
     if type(maximum) is not int or maximum < 1024 or maximum > MAX_CAB_SNAPSHOT_BYTES:
         raise CABSnapshotError("CAB snapshot limit is outside the supported profile")
-    entries = _decode(snapshot_bytes, maximum=maximum)
+    entries = decode_cab_snapshot_entries(snapshot_bytes, maximum=maximum)
     paths = [path for path, _content in entries]
     if not paths or paths[0] != "bundle.json" or paths.count("bundle.json") != 1:
         raise CABSnapshotError("CAB snapshot must contain one leading bundle.json")
@@ -359,7 +389,7 @@ def capture_cab_snapshot(
                 raise CABSnapshotError("CAB snapshot exceeds the configured byte limit")
     finally:
         os.close(root_descriptor)
-    encoded = _encode(tuple(entries), maximum=maximum)
+    encoded = encode_cab_snapshot_entries(tuple(entries), maximum=maximum)
     sealed = verify_cab_snapshot(encoded, maximum=maximum)
     if sealed.cab_id != first.bundle_id:
         raise CABSnapshotError("CAB identity changed while the snapshot was captured")
@@ -384,5 +414,7 @@ __all__ = [
     "CABSnapshotError",
     "SealedCABSnapshot",
     "capture_cab_snapshot",
+    "decode_cab_snapshot_entries",
+    "encode_cab_snapshot_entries",
     "verify_cab_snapshot",
 ]
