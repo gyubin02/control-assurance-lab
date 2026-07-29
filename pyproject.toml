@@ -4,12 +4,29 @@ build-backend = "hatchling.build"
 
 [project]
 name = "control-assurance-lab"
-version = "0.0.1"
-description = "Experimental security-control assurance engine"
+version = "0.1.0"
+description = "Reproducible experiments that expose security-control failures masked by safe outcomes"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
   { name = "Gyubin Lee" },
+]
+keywords = [
+  "control assurance",
+  "evidence",
+  "reproducible security",
+  "security testing",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
 ]
 dependencies = [
   "cryptography>=46,<47",
@@ -20,6 +37,11 @@ dependencies = [
 
 [project.scripts]
 assurance-lab = "assurance_lab.cli:main"
+
+[project.urls]
+Documentation = "https://gyubin02.github.io/control-assurance-lab/"
+Issues = "https://github.com/gyubin02/control-assurance-lab/issues"
+Repository = "https://github.com/gyubin02/control-assurance-lab"
 
 [project.optional-dependencies]
 dev = [
