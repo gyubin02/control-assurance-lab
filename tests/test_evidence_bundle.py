@@ -1,6 +1,7 @@
 import hashlib
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -299,7 +300,11 @@ def test_hardlinked_payload_is_rejected(tmp_path: Path) -> None:
 def test_duplicate_or_traversal_manifest_paths_are_rejected(tmp_path: Path) -> None:
     payload = b'{"id":"event:1"}\n'
     manifest = _manifest(payload).model_dump(mode="json")
-    manifest["files"][0]["path"] = "records/../outside.json"  # type: ignore[index]
+    files = manifest["files"]
+    assert isinstance(files, list)
+    first = files[0]
+    assert isinstance(first, dict)
+    first["path"] = "records/../outside.json"
     _write_manifest_dict(tmp_path, manifest)
 
     result = verify_bundle(tmp_path)
@@ -399,7 +404,10 @@ def test_same_inode_payload_overwrite_after_hash_is_detected(
     real_hash_payload = bundle_module._hash_payload
     overwritten = False
 
-    def overwrite_after_hash(*args, **kwargs):
+    def overwrite_after_hash(
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[str, int, bytes | None]:
         nonlocal overwritten
         result = real_hash_payload(*args, **kwargs)
         if not overwritten:

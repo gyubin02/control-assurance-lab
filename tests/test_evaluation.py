@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -47,6 +48,7 @@ from assurance_lab.evaluation import (
     CleanupReference,
     CleanupState,
     CleanupVerificationResult,
+    EvaluationReport,
     EvidenceBinding,
     ExecutedStageEvent,
     ExerciseState,
@@ -54,6 +56,7 @@ from assurance_lab.evaluation import (
     FreshClone,
     MetricEvidenceFailure,
     MetricEvidenceResult,
+    ObligationAssessment,
     ResidualClassification,
     SkippedStageEvent,
     Trace,
@@ -462,7 +465,7 @@ def cleanup_evidence(
     *,
     state: CleanupState = CleanupState.VERIFIED,
     evidence_id: str | None = None,
-    observed_at=None,
+    observed_at: datetime | None = None,
     extra_artifact_ids: tuple[str, ...] = (),
 ) -> AdmittedCleanupEvidence:
     binding = CleanupBinding(
@@ -492,11 +495,13 @@ def evaluate(
     values: dict[tuple[str, Stage, str], bool],
     *,
     metric_evidence_ids: dict[tuple[str, Stage, str], str] | None = None,
-    metric_overrides: dict[tuple[str, Stage, str], MetricEvidenceResult] | None = None,
-    attestation_overrides: dict[str, TrialAttestationResult] | None = None,
-    cleanup_overrides: dict[str, CleanupVerificationResult] | None = None,
-):
-    attestations = {record.trial_key: attestation_for(compiled, record) for record in records}
+    metric_overrides: Mapping[tuple[str, Stage, str], MetricEvidenceResult] | None = None,
+    attestation_overrides: Mapping[str, TrialAttestationResult] | None = None,
+    cleanup_overrides: Mapping[str, CleanupVerificationResult] | None = None,
+) -> EvaluationReport:
+    attestations: dict[str, TrialAttestationResult] = {
+        record.trial_key: attestation_for(compiled, record) for record in records
+    }
     attestations.update(attestation_overrides or {})
     metrics: dict[tuple[str, Stage, str], MetricEvidenceResult] = {}
     for key, value in values.items():
@@ -512,7 +517,9 @@ def evaluate(
             evidence_id=(metric_evidence_ids or {}).get(key),
         )
     metrics.update(metric_overrides or {})
-    cleanups = {record.trial_key: cleanup_evidence(compiled, record) for record in records}
+    cleanups: dict[str, CleanupVerificationResult] = {
+        record.trial_key: cleanup_evidence(compiled, record) for record in records
+    }
     cleanups.update(cleanup_overrides or {})
     return ExperimentEvaluator().evaluate(
         compiled,
@@ -575,7 +582,7 @@ def full_records_and_values(
     return records, values
 
 
-def assessment(report, obligation_id: str):
+def assessment(report: EvaluationReport, obligation_id: str) -> ObligationAssessment:
     return next(
         item for item in report.obligation_assessments if item.obligation_id == obligation_id
     )
@@ -953,6 +960,8 @@ def test_reused_cross_trial_lineage_cannot_support_contrast() -> None:
                 }
             )
 
+        assert isinstance(record.trace.target, ExecutedStageEvent)
+        assert isinstance(record.trace.compensator, ExecutedStageEvent)
         trace = record.trace.model_copy(
             update={
                 "trace_id": "shared-trace",
