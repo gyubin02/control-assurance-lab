@@ -1,20 +1,34 @@
 # Control Assurance Lab
 
-A green outcome can hide a broken security control.
+[![CI](https://github.com/gyubin02/control-assurance-lab/actions/workflows/checks.yml/badge.svg)](https://github.com/gyubin02/control-assurance-lab/actions/workflows/checks.yml)
+[![Release](https://img.shields.io/github/v/release/gyubin02/control-assurance-lab?display_name=tag&sort=semver)](https://github.com/gyubin02/control-assurance-lab/releases/tag/v0.1.0)
+[![License](https://img.shields.io/badge/license-Apache--2.0-1f4b3f.svg)](LICENSE)
 
-Control Assurance Lab runs matched interventions and keeps enough raw evidence
-to recompute which control succeeded, which one failed, and whether a later
-safeguard merely covered the failure.
+Control Assurance Lab identifies which security control failed—even when a
+downstream safeguard kept the final outcome safe. v0.1.0 combines reproducible
+matched-intervention experiments with an identity-bound evidence runtime and a
+change-controlled web control plane.
 
-![Verified case view: zero records were delivered, but the entitlement control selected ten out-of-scope records](docs/assets/readme-hero.png)
+> **Status:** alpha reference implementation. The included cases are synthetic.
+> Production use requires institution-owned identity, PostgreSQL, KMS, WORM
+> storage, network controls, and operational acceptance.
 
-## The first case
+![Control Assurance change desk with an applied first generation and a second generation awaiting independent review](docs/assets/control-plane-hero.png)
+
+*The real v0.1.0 interface with synthetic operator data. Production access
+requires SSO; no demo login is shipped.*
+
+[Inspect the verified case](https://gyubin02.github.io/control-assurance-lab/web/)
+· [Read the v0.1.0 release](https://github.com/gyubin02/control-assurance-lab/releases/tag/v0.1.0)
+· [Review the pilot boundary](docs/financial-pilot-boundary.md)
+
+## Why this exists
 
 A support export requests records belonging to ten unassigned customers. The
 entitlement boundary wrongly selects all ten. A release guard then blocks the
 export, so no customer record leaves the system.
 
-An outcome-only check is right about the ending and wrong about the control:
+An outcome-only check sees a pass. The evidence says something more useful:
 
 ```text
 Entitlement boundary  10 out-of-scope records selected   REFUTED
@@ -25,45 +39,50 @@ Final-outcome-only   PASS
 Control-specific     MASKED TARGET FAILURE
 ```
 
-That conclusion is recomputed from 16 executions on fresh SQLite clones:
+![Verified synthetic case: zero records were delivered, but the entitlement control selected ten out-of-scope records](docs/assets/readme-hero.png)
 
-```text
-attack / benign
-× wildcard misgrant / case-scoped entitlement
-× monitor-only / enforcing release guard
-× steady / sham redeploy
-```
+The finding is recomputed from 16 executions on fresh SQLite clones. A full
+factorial matrix varies the request, entitlement, release guard, and redeploy
+behavior, then recomputes matched contrasts while retaining a benign request as
+a service check. Missing evidence, reused lineage, failed cleanup, or a
+mismatched intervention prevents a positive conclusion.
 
-The assigned-customer request must still work in every relevant cell. Missing
-evidence, reused trial lineage, a failed cleanup, or a mismatched intervention
-prevents a positive conclusion.
-
-## Run it
+## Start with the checked-in evidence
 
 Python 3.12.x is required. The upper bound is intentional: the locked
-environment and release image are not qualified on Python 3.13 yet.
+environment and release image are not qualified on Python 3.13.
 
 ```bash
-git clone https://github.com/gyubin02/control-assurance-lab.git
+git clone --branch v0.1.0 --depth 1 \
+  https://github.com/gyubin02/control-assurance-lab.git
 cd control-assurance-lab
-python -m venv .venv
+
+python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install \
   --only-binary=:all: --require-hashes -r requirements/ci.lock
-python -m pip install --no-deps --no-build-isolation -e .
+python -m pip install --no-deps --no-build-isolation .
 
 assurance-lab verify examples/masked-export.cab
 ```
 
-To reproduce the case from a fresh set of clones:
+The last command should end with:
+
+```text
+Final-outcome-only   PASS
+Control-specific     MASKED TARGET FAILURE
+Evidence             cab:sha256:a0d192d2...02725136c4a3
+Scope                synthetic · simulated clock · integrity-only
+```
+
+Rebuild the case from a fresh set of clones:
 
 ```bash
 assurance-lab run /tmp/masked-export.cab
 assurance-lab verify /tmp/masked-export.cab --json
 ```
 
-The signature decision and the sealed evidence bytes are deliberately separate
-operations. Both can be exercised without a service or network:
+Signature policy and sealed evidence bytes are separate decisions:
 
 ```bash
 assurance-lab dsse verify \
@@ -78,99 +97,52 @@ assurance-lab cab snapshot create examples/masked-export.cab \
 assurance-lab cab snapshot verify /tmp/masked-export.cabsnap
 ```
 
-The single-node reference admission boundary also has an operational CLI:
+The dependency-free Node verifier supplies a second integrity implementation:
 
 ```bash
-assurance-lab admission config validate --config /srv/assurance-lab/admission.json
-assurance-lab admission policy install --config /srv/assurance-lab/admission.json \
-  --policy /secure-transfer/collector-policy.json --revision 1
-assurance-lab admission lease register --config /srv/assurance-lab/admission.json \
-  --grant /secure-transfer/job-0001.signed-lease.json
-assurance-lab admission bundle admit --config /srv/assurance-lab/admission.json \
-  --envelope /secure-transfer/job-0001.dsse.json --cab /secure-transfer/job-0001.cab
+npm test --prefix verifier-js
+npm run --prefix verifier-js verify:example
 ```
 
-Keys, password files, permissions, exact retry, and interrupted-custody recovery
-are covered in
-[`docs/admission-operations.md`](docs/admission-operations.md).
-
-The static case note is also derived from the checked-in bundle:
-
-```bash
-python -m http.server 8000
-```
-
-Open `http://127.0.0.1:8000/web/`. The page hashes the manifest and every listed
-file before rendering. It reconstructs the displayed cell, intervention labels,
-and raw values in the browser. It is not a second implementation of the complete
-experiment evaluator; the CLI remains the semantic verifier.
-
-The dependency-free Node verifier provides a separate integrity implementation:
-
-```bash
-cd verifier-js
-npm test
-npm run verify:example
-```
-
-That command checks the generic CAB integrity profile; it does not evaluate a
-scenario. The public lifecycle benchmark has a different Node implementation
-that recomputes its fixed semantics from raw records:
+It verifies the generic CAB integrity profile, not arbitrary experiment
+semantics. The fixed lifecycle benchmark has a separate Node evaluator:
 
 ```bash
 assurance-lab benchmark release build /tmp/financial-control-lifecycle-v1
 assurance-lab benchmark release verify /tmp/financial-control-lifecycle-v1
 ```
 
-The builder runs three synthetic scenarios, 16 factorial cells per scenario,
-and three exact replicates per cell: 144 executions in total. It also builds
-and replays the frozen C01–C20 corruption corpus. The Python producer/verifier
-and the dependency-free Node semantic verifier must agree before the release
-directory is accepted. No benchmark directory or tagged benchmark artifact is
-published from this repository today; the command above creates a local,
-content-closed result.
+That build runs three synthetic scenarios, 16 factorial cells per scenario,
+and three exact replicates per cell: 144 executions. It also replays the frozen
+C01–C20 corruption corpus and requires the Python and Node evaluators to agree.
+v0.1.0 does not include a precomputed benchmark result; the command creates a
+local, content-closed result.
 
-## Production control path
+## What ships in v0.1.0
 
-The web control plane records approved desired state and a deployment outbox;
-it does not receive runtime-catalog write permission. Two deployment
-reconcilers may run at once. PostgreSQL claims one operation with compare-and-
-swap, `FOR UPDATE SKIP LOCKED`, an expiring lease, and a monotonically
-increasing fence before an adapter is called. Therefore two healthy replicas
-racing for the same pending operation begin one adapter call.
+| Surface | Implemented boundary |
+|---|---|
+| Control experiments | Matched interventions, benign-service checks, raw receipts, and prevention/detection/response/recovery lifecycle invariants |
+| Evidence and admission | Bounded CAB verification, DSSE trust policy, one-time leases, sealed snapshots, replay state, signed receipts, and custody acknowledgements |
+| Change desk | Entra OIDC/PKCE, tenant roles, immutable revisions, fresh-MFA maker/checker rules, audit chaining, and separate desired/applied state |
+| Runtime | Elastic Security and Defender XDR source composition, short-lived credential paths, separated journals, streaming evidence closure, and independent Node capture verification |
+| Delivery | PostgreSQL 17 integration, leased and fenced reconciliation, idempotent runtime receipts, immutable Kubernetes rendering, and a signed, attested multi-platform container release |
 
-A crash after the target commits is different: the reclaimed operation can
-call the adapter again with the same operation ID and a higher fence. The
-runtime target keeps that ID as its idempotency key, observes an existing exact
-receipt instead of making a second logical change, and rejects stale lower
-fences. This is not a claim of exactly-once network delivery.
+The installed package exposes four entry points:
 
-The checked-in workload YAML is deliberately undeployable: application and
-Vault images carry recognizable placeholder digests. The release renderer
-replaces them with approved immutable images, binds every rendered manifest
-and its source into one externally pinned lock digest, and rejects any later
-file or image drift. The rendered set also starts from namespace-wide
-default-deny network policy. A mandatory release-bound site contract generates
-exact DNS-query and FQDN/port Cilium policy plus a static CIDR routing envelope
-through at least two explicit egress gateways. The site perimeter must allow
-those gateway sources only to contracted CIDRs and block all direct external
-pod/node egress. The v3 contract pins the exact pod/node source CIDRs, the
-allow-before-deny rule order, and an explicitly IPv4-only deployment boundary;
-it does not pretend to prove the live firewall.
+```text
+assurance-lab
+assurance-control-plane
+assurance-deployment-reconciler
+assurance-runtime-worker
+```
 
-The production bootstrap, Kubernetes boundary, migration principal, OIDC/Key
-Vault preflight, runtime-release gate, and failure procedures are in
-[`docs/control-plane-deployment.md`](docs/control-plane-deployment.md).
-The separate maker/checker procedure for adopting an identity-bound
-publication is in
-[`docs/publishing-recovery-runbook.md`](docs/publishing-recovery-runbook.md).
-
-The browser control plane is served at `/control/` and has no development-login
-fallback. Entra group entitlements produce bounded application roles:
+The browser control plane is served at `/control/`. It has no development-login
+fallback. Entra group entitlements map to bounded application roles:
 
 | Role | Effective action |
 |---|---|
-| `viewer` | Read controls, revisions, desired state, applied state, and deployment operations |
+| `viewer` | Read controls, revisions, desired state, applied state, and operations |
 | `editor` | Create drafts and submit their own revisions |
 | `approver` | Approve or reject another person's submitted revision |
 | `deployer` | Activate, retry, or roll back another person's approved revision |
@@ -178,79 +150,100 @@ fallback. Entra group entitlements produce bounded application roles:
 | `administrator` | Satisfy role checks, but not bypass maker/checker rules |
 
 Approval and deployment require MFA from an authentication no more than one
-hour old. A revision author cannot approve, activate, retry, or roll back their
-own change. The UI shows desired state separately from the latest operation
-that the runtime target actually accepted; an approved request is not presented
-as an applied deployment.
+hour old. An author cannot approve, activate, retry, or roll back their own
+change.
 
-## What is here today
-
-| Surface | Current boundary |
-|---|---|
-| Preventive reference case | Deterministic synthetic 16-cell experiment; recomputed from raw SQLite and operation receipts |
-| CAB integrity | Bounded Python verifier, independent streaming Node verifier, and a browser check for displayed facts |
-| Signer decision | Fail-closed DSSE profile with an external Ed25519 trust policy, threshold rules, key validity, and bounded inputs |
-| Admission and custody | Single-node reference implementation for one-time leases, sealed CAB snapshots, replay state, signed receipts, and custody acknowledgements |
-| Incident lifecycle | Synthetic response and recovery paths with monotone disclosure history and exact-session cutover evidence; library surface, not a general CLI |
-| Public benchmark | Local release builder for 3 scenarios × 16 cells × 3 replicates, C01–C20 corruption replay, and independent Node semantic recomputation; no tagged result is published |
-
-The larger service path is production-shaped, but its checked-in tests stop at
-explicit boundaries:
-
-| Component | Implemented and exercised here | Boundary still owned by a deployment |
-|---|---|---|
-| Control plane | Entra OIDC/PKCE, tenant RBAC, fresh-MFA maker/checker workflow, desired/applied separation, PostgreSQL role tests | Institution IdP, ingress, certificates, and operator access review |
-| Deployment reconciler and catalog | Durable outbox leases, fences, idempotent runtime receipts, immutable profiles, PostgreSQL 17 integration | Database HA, network partitions, backups, and site SLO |
-| Runtime worker | Elastic Security or Defender XDR source composition, separated journals, fenced publication, evidence closure | Live tenant permissions, retention policy, on-call reconciliation |
-| Key and custody adapters | Azure Key Vault, Vault Transit, AWS workload identity, and S3 Object Lock contracts | Institution-owned cloud resources, key ceremonies, WORM policy, and external anchor |
-| Kubernetes boundary | Immutable release rendering, exact image/config bindings, default-deny plus site egress contract | Live Cilium/firewall enforcement and cluster admission evidence |
-| Container release | Non-root image contract and a scan-before-publish, digest-signing workflow | A published tag and consumer acceptance decision |
-
-The distinction between those rows matters. A valid bundle digest establishes
-integrity. A valid signature can establish an authorized signer under one policy.
-Neither fact alone proves freshness, consumes a job lease, writes immutable
-custody, or demonstrates that a production control is effective.
+## Architecture
 
 ```text
-raw receipts ──> CAB integrity ──> scenario recomputation
-                    │
-                    ├── independent Node integrity check
-                    └── browser reconstruction of displayed facts
+Entra OIDC operator
+        │
+        ▼
+change desk ── desired revision + durable outbox ──> PostgreSQL
+                                                        │
+                                             deployment reconciler
+                                                        │
+                                             applied receipt + catalog
+                                                        │
+                                                scheduler / worker
+                                                ╱                 ╲
+                                      Elastic Security      Defender XDR
+                                                ╲                 ╱
+                                      raw source + operation receipts
+                                                        │
+                                           CAB stream snapshot
+                                            ╱              ╲
+                          Python + independent Node     signed custody closure
+                                verification                     │
+                                                       S3 Object Lock
 
-DSSE envelope + external policy + one-time lease
-                    │
-                    └── admission receipt + custody acknowledgement
+Separate offline admission path:
+DSSE envelope + trust policy + one-time lease
+        └──> admission receipt + custody acknowledgement
 ```
 
-## What it does not claim
+The control plane can select desired state but cannot write the runtime catalog.
+Reconcilers claim operations with an expiring lease and increasing fence. The
+runtime target uses the immutable operation ID as an idempotency key and returns
+an exact receipt. A retry after an ambiguous network outcome may repeat a call;
+the design does not claim exactly-once network delivery.
 
-This repository is not itself a deployed production service and contains no
-live attack target or customer data. Its connector, SSO, PAM, KMS, custody, and
-high-availability paths are hardened reference implementations; a real
-deployment still needs site-owned identities, endpoints, policy overlays,
-managed HA/WORM services, and an external transparency anchor. The generic
-Node CAB program checks integrity only. The fixed lifecycle benchmark has its
-own Node semantic evaluator, but there is not yet a general independent
-semantic evaluator for arbitrary experiment profiles.
+Elastic uses a bounded just-in-time API-key path. Defender uses workload
+identity and a tenant-bound token journal. Neither connector receives a static
+credential through the evidence model. Runtime identity, configuration,
+source request, signing, and custody selections are fixed before collection
+begins.
 
-Passing the synthetic cases is not evidence of regulatory compliance or of
-effectiveness in an operating financial network. The proposed path to a
-read-only, isolated financial-sector pilot—and the conditions that stop such a
-pilot—is documented in
-[`docs/financial-pilot-boundary.md`](docs/financial-pilot-boundary.md).
+## What the repository proves—and what it does not
+
+| Checked here | Still owned by a deployment |
+|---|---|
+| Synthetic case conclusions recomputed from raw receipts | Effectiveness in a live financial network |
+| Replica races and recovery tested against PostgreSQL 17 | Database HA, backups, partitions, and site SLOs |
+| Hermetic Elastic/Defender connector tests and opt-in live conformance harnesses | Live tenant permissions, retention, and on-call reconciliation |
+| Entra, Vault, Key Vault, AWS workload identity, and S3 Object Lock adapters | Institution identities, key ceremonies, cloud policy, and external anchoring |
+| Immutable image/config rendering and a default-deny egress contract | Live Cilium, perimeter firewall, DNS, and cluster-admission enforcement |
+| Digest signing and GitHub build provenance | Consumer-side digest admission and deployment approval |
+
+A valid bundle digest establishes integrity. A valid signature can establish an
+authorized signer under one policy. Neither alone proves freshness, consumes a
+job lease, writes immutable custody, or proves that a production control is
+effective.
+
+This repository contains no live attack target or customer data. Passing its
+cases is not evidence of regulatory compliance. The generic Node CAB program
+checks integrity only; it is not a general independent semantic evaluator for
+arbitrary experiment profiles.
+
+## Container release
+
+The `v0.1.0` tag publishes the same source as a non-root `linux/amd64` and
+`linux/arm64` image:
+
+```bash
+docker pull ghcr.io/gyubin02/control-assurance-lab:0.1.0
+docker run --rm ghcr.io/gyubin02/control-assurance-lab:0.1.0 \
+  assurance-lab --version
+```
+
+The version tag is for discovery, not production admission. Pin the immutable
+index digest from the GitHub Release and verify its Cosign identity and GitHub
+attestation by following the
+[consumer verification contract](deploy/container/README.md).
 
 ## Operate the implemented paths
 
 - [Control-plane deployment, OIDC, database roles, and network release](docs/control-plane-deployment.md)
 - [Deployment reconciliation and desired/applied semantics](docs/deployment-reconciliation.md)
-- [Runtime worker deployment and recovery boundary](docs/runtime-worker-deployment.md)
+- [Runtime worker deployment and recovery](docs/runtime-worker-deployment.md)
 - [Runtime catalog, scheduling, and PostgreSQL privileges](docs/runtime-catalog-and-scheduling.md)
 - [Elastic Security live conformance](docs/elastic-security-live-conformance.md)
-- [Defender XDR operations and opt-in live conformance](docs/defender-xdr-live-conformance.md)
+- [Defender XDR operations and live conformance](docs/defender-xdr-live-conformance.md)
+- [Evidence admission and custody](docs/admission-operations.md)
 - [S3 Object Lock custody](docs/s3-object-lock-operations.md)
 - [Vault Transit signing](docs/vault-transit-operations.md)
-- [Azure workload identity and Key Vault operations](docs/azure-workload-identity.md)
-- [Production container and consumer verification contract](deploy/container/README.md)
+- [Azure workload identity and Key Vault](docs/azure-workload-identity.md)
+- [Publishing recovery and identity-bound adoption](docs/publishing-recovery-runbook.md)
 
 ## Development
 
@@ -258,22 +251,18 @@ pilot—is documented in
 .venv/bin/ruff check .
 .venv/bin/mypy src tests
 .venv/bin/pytest
-(cd verifier-js && npm test)
+npm test --prefix verifier-js
+node --test web/app.test.js
+node --test src/assurance_lab/control_plane/static/model.test.mjs
 ```
 
-The CI workflow uses hash-locked Python dependencies and commit-pinned GitHub
-Actions. A checked-in regression rebuilds `web/case.json` from the example CAB,
-so a stale derived case cannot quietly replace the evidence. The image above is
-a deterministic capture of that verified browser state; regenerate it with
-`scripts/capture-readme-hero.mjs`.
+CI uses hash-locked Python dependencies and commit-pinned GitHub Actions. It
+also rebuilds `web/case.json` from the checked-in CAB so a stale derived page
+cannot quietly replace the evidence. The case image above is regenerated from
+that verified browser state with `scripts/capture-readme-hero.mjs`; the control
+plane image uses synthetic data and the production UI assets.
 
-Selected design notes:
-
-- [Experimental semantics](docs/experimental-semantics.md)
-- [Control Assurance DSSE Profile v1](docs/control-assurance-dsse-profile-v1.md)
-- [Evidence bundle design](research/evidence-bundle-design.md)
-- [Benchmark protocol](research/benchmark-protocol.md)
-- [Why a valid signature is not an admission](decisions/0009-a-valid-signature-is-not-an-admission.md)
-- [Why benchmark results are recomputed, not asserted](decisions/0010-benchmark-results-are-recomputed-not-asserted.md)
+See [CONTRIBUTING.md](CONTRIBUTING.md) for focused contribution paths and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 Apache-2.0 licensed.

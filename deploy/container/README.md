@@ -70,9 +70,8 @@ identity; a mutable tag is not a trust anchor.
 
 ## Verify a published release as a consumer
 
-The workflow defines how a future release is published; this document does not
-claim that a particular tag currently exists. Obtain the canonical `vX.Y.Z`
-source tag and `sha256:...` index digest from the release record, then verify
+The first published release is `v0.1.0`. Obtain the canonical `vX.Y.Z` source
+tag and `sha256:...` index digest from its GitHub Release record, then verify
 the immutable subject rather than trusting the version tag:
 
 ```sh
@@ -106,8 +105,8 @@ The first check detects a tag that no longer names the reviewed digest. Cosign
 then verifies the keyless workflow identity on that digest, and GitHub CLI
 verifies the registry-hosted build provenance against this repository, the
 release workflow, the source tag, and the reviewed source commit. An
-installation should obtain `SOURCE_DIGEST` from the signed release record,
-compare it with the reviewed tag, and record the accepted image digest,
+installation should obtain `SOURCE_DIGEST` from the reviewed GitHub Release
+record, compare it with the reviewed tag, and record the accepted image digest,
 workflow identity, source ref, and source digest in its release approval. It
 should not resolve the tag again during deployment.
 

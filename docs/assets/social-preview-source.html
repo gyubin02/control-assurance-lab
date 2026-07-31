@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=1280, initial-scale=1">
+    <title>Control Assurance Lab social preview</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 1280px;
+        height: 640px;
+        margin: 0;
+        overflow: hidden;
+      }
+
+      body {
+        color: #111714;
+        background: #f2efe6;
+        font-family: Arial, Helvetica, sans-serif;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: 600px 1fr;
+        width: 100%;
+        height: 100%;
+        border: 1px solid #303832;
+      }
+
+      .message {
+        display: flex;
+        flex-direction: column;
+        padding: 56px 58px 48px;
+        border-right: 1px solid #303832;
+      }
+
+      .mark {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        color: #4b554f;
+        font-size: 15px;
+        letter-spacing: 0.17em;
+        text-transform: uppercase;
+      }
+
+      .mark-box {
+        display: grid;
+        width: 42px;
+        height: 42px;
+        place-items: center;
+        border: 1px solid #303832;
+        color: #111714;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 15px;
+        letter-spacing: 0;
+      }
+
+      h1 {
+        max-width: 470px;
+        margin: 74px 0 24px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 61px;
+        font-weight: 500;
+        letter-spacing: -0.045em;
+        line-height: 0.98;
+      }
+
+      .subhead {
+        max-width: 430px;
+        margin: 0;
+        color: #46504a;
+        font-size: 21px;
+        line-height: 1.45;
+      }
+
+      .release {
+        margin-top: auto;
+        color: #52615a;
+        font-size: 14px;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .product {
+        position: relative;
+        overflow: hidden;
+        background: #e8e4d9;
+      }
+
+      .product img {
+        position: absolute;
+        top: 0;
+        left: 50%;
+        width: 1138px;
+        height: 640px;
+        max-width: none;
+        transform: translateX(-47%);
+      }
+
+      .product::after {
+        position: absolute;
+        inset: 0;
+        border: 20px solid #f2efe6;
+        content: "";
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="message">
+        <div class="mark">
+          <span class="mark-box">CA</span>
+          <span>Control Assurance Lab</span>
+        </div>
+        <h1>A safe outcome can hide a failed control.</h1>
+        <p class="subhead">Recompute the control—not just the result.</p>
+        <p class="release">v0.1.0 · Evidence-first security assurance</p>
+      </section>
+      <section class="product" aria-label="Control plane preview">
+        <img
+          src="./control-plane-hero.png"
+          alt="Control Assurance change desk with one applied revision and one revision in review"
+        >
+      </section>
+    </main>
+  </body>
+</html>

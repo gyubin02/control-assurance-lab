@@ -46,12 +46,18 @@ def test_public_pages_share_one_exact_social_card() -> None:
             "Nothing left the system. The first control still failed."
         )
         assert parser.meta["og:image"] == SOCIAL_IMAGE_URL
+        assert parser.meta["og:image:alt"] == (
+            "Control Assurance Lab launch card beside the change desk interface"
+        )
         assert parser.meta["og:image:width"] == "1280"
         assert parser.meta["og:image:height"] == "640"
         assert parser.meta["twitter:card"] == "summary_large_image"
 
 
-def test_readme_hero_keeps_its_documented_capture_size() -> None:
+def test_readme_images_keep_their_documented_capture_sizes() -> None:
+    assert _png_dimensions(
+        REPOSITORY_ROOT / "docs/assets/control-plane-hero.png"
+    ) == (1600, 900)
     assert _png_dimensions(REPOSITORY_ROOT / "docs/assets/readme-hero.png") == (
         1440,
         960,
