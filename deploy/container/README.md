@@ -10,7 +10,7 @@ The image contract is intentionally narrow:
 - build and runtime dependencies are separate, hash-pinned, wheel-only locks;
 - the project is installed from its wheel, not from a mutable source checkout;
 - the runtime contains no `pip`;
-- PID 1 runs as UID/GID 10000 with no login shell;
+- PID 1 runs as UID/GID 10000 with no passwd entry or login shell;
 - `/tmp`, trust material, credentials, and working data are runtime mounts;
 - service shutdown is `SIGTERM`; Kubernetes owns liveness/readiness probes;
 - the image contains no tenant configuration, credential, token, or private key.

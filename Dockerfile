@@ -69,15 +69,7 @@ ENV HOME=/tmp \
     PYTHONHASHSEED=random \
     PYTHONUNBUFFERED=1
 
-RUN groupadd --gid 10000 control-assurance \
-    && useradd \
-         --uid 10000 \
-         --gid 10000 \
-         --home-dir /nonexistent \
-         --no-create-home \
-         --shell /usr/sbin/nologin \
-         control-assurance \
-    && install -d \
+RUN install -d \
          --owner=10000 \
          --group=10000 \
          --mode=0700 \

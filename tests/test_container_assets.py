@@ -36,7 +36,8 @@ def test_container_build_is_digest_and_dependency_pinned() -> None:
 
 def test_runtime_image_has_a_non_privileged_secret_free_default() -> None:
     assert "USER 10000:10000" in _DOCKERFILE
-    assert "--shell /usr/sbin/nologin" in _DOCKERFILE
+    assert "groupadd" not in _DOCKERFILE
+    assert "useradd" not in _DOCKERFILE
     assert 'CMD ["assurance-lab", "--help"]' in _DOCKERFILE
     assert "ENTRYPOINT" not in _DOCKERFILE
     assert "ARG SECRET" not in _DOCKERFILE
