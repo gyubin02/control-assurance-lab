@@ -352,7 +352,7 @@ def test_fallback_path_effect_is_independent_of_the_named_rule(
 
 @pytest.mark.parametrize(
     ("exact_active", "fallback_forward", "collector_reload"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_tested_benign_action_is_unalerted_in_all_eight_cells(
     exact_active: bool,
@@ -384,7 +384,7 @@ def test_tested_benign_action_is_unalerted_in_all_eight_cells(
 
 @pytest.mark.parametrize(
     ("suspicious", "exact_active", "fallback_forward"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_collector_reload_is_a_behavior_free_sham(
     suspicious: bool,

@@ -3,8 +3,10 @@
 These adapters make the admission boundary usable without asking an integrator
 to invent its three security-sensitive I/O implementations:
 
+* :class:`Ed25519PublicKeyLeaseVerifier` verifies lease signatures from a raw
+  or SubjectPublicKeyInfo PEM Ed25519 public key; it cannot issue leases.
 * :class:`Ed25519PEMReceiptSigner` loads one PKCS#8 Ed25519 private key from
-  caller-supplied PEM bytes.
+  caller-supplied PEM bytes for receipt signing.
 * :class:`DigestDirectoryTrustPolicyResolver` resolves one exact immutable
   ``(policy id, revision, digest)`` from an owner-private directory.
 * :class:`AtomicFilesystemCustodyStore` publishes one content-addressed object
@@ -37,7 +39,10 @@ from typing import Self
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from assurance_lab.evidence.admission import DetachedSignature
 from assurance_lab.evidence.attestation import (
@@ -48,6 +53,7 @@ from assurance_lab.evidence.attestation import (
 from assurance_lab.evidence.snapshot import MAX_CAB_SNAPSHOT_BYTES
 
 MAX_PRIVATE_KEY_PEM_BYTES = 64 * 1024
+MAX_PUBLIC_KEY_PEM_BYTES = 64 * 1024
 MAX_CUSTODY_RECEIPT_BYTES = 1024 * 1024
 
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -61,10 +67,10 @@ _PKCS8_PEM_HEADERS = (
 )
 _PKCS8_PEM_FOOTERS = {
     b"-----BEGIN PRIVATE KEY-----": b"-----END PRIVATE KEY-----",
-    b"-----BEGIN ENCRYPTED PRIVATE KEY-----": (
-        b"-----END ENCRYPTED PRIVATE KEY-----"
-    ),
+    b"-----BEGIN ENCRYPTED PRIVATE KEY-----": (b"-----END ENCRYPTED PRIVATE KEY-----"),
 }
+_PUBLIC_KEY_PEM_HEADER = b"-----BEGIN PUBLIC KEY-----"
+_PUBLIC_KEY_PEM_FOOTER = b"-----END PUBLIC KEY-----"
 _PEM_TRAILING_WHITESPACE = b" \t\r\n"
 _MAX_PEM_TRAILING_WHITESPACE_BYTES = 64
 _DIRECTORY_FLAGS = (
@@ -73,9 +79,7 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_DIRECTORY", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
-_FILE_READ_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-)
+_FILE_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_WRITE_FLAGS = (
     os.O_WRONLY
     | os.O_CREAT
@@ -136,11 +140,7 @@ def _validate_policy_locator(
 ) -> tuple[str, int, str]:
     if type(policy_id) is not str or _VISIBLE_ASCII_RE.fullmatch(policy_id) is None:
         raise ValueError("policy id must be non-empty visible ASCII up to 256 bytes")
-    if (
-        type(policy_revision) is not int
-        or policy_revision < 1
-        or policy_revision > (2**63 - 1)
-    ):
+    if type(policy_revision) is not int or policy_revision < 1 or policy_revision > (2**63 - 1):
         raise ValueError("policy revision must be an integer from 1 through 2^63-1")
     return (
         policy_id,
@@ -151,11 +151,7 @@ def _validate_policy_locator(
 
 def _require_single_pkcs8_pem(private_key_pem: bytes) -> None:
     header = next(
-        (
-            candidate
-            for candidate in _PKCS8_PEM_HEADERS
-            if private_key_pem.startswith(candidate)
-        ),
+        (candidate for candidate in _PKCS8_PEM_HEADERS if private_key_pem.startswith(candidate)),
         None,
     )
     if header is None:
@@ -165,11 +161,26 @@ def _require_single_pkcs8_pem(private_key_pem: bytes) -> None:
     if footer_offset < 0:
         raise ValueError("private key must contain one matching PKCS#8 PEM block")
     trailing = private_key_pem[footer_offset + len(footer) :]
-    if (
-        len(trailing) > _MAX_PEM_TRAILING_WHITESPACE_BYTES
-        or trailing.strip(_PEM_TRAILING_WHITESPACE)
+    if len(trailing) > _MAX_PEM_TRAILING_WHITESPACE_BYTES or trailing.strip(
+        _PEM_TRAILING_WHITESPACE
     ):
         raise ValueError("private key must contain exactly one PKCS#8 PEM block")
+
+
+def _require_single_public_key_pem(public_key_pem: bytes) -> None:
+    if not public_key_pem.startswith(_PUBLIC_KEY_PEM_HEADER):
+        raise ValueError("public key must use SubjectPublicKeyInfo PEM encoding")
+    footer_offset = public_key_pem.find(
+        _PUBLIC_KEY_PEM_FOOTER,
+        len(_PUBLIC_KEY_PEM_HEADER),
+    )
+    if footer_offset < 0:
+        raise ValueError("public key must contain one matching PEM block")
+    trailing = public_key_pem[footer_offset + len(_PUBLIC_KEY_PEM_FOOTER) :]
+    if len(trailing) > _MAX_PEM_TRAILING_WHITESPACE_BYTES or trailing.strip(
+        _PEM_TRAILING_WHITESPACE
+    ):
+        raise ValueError("public key must contain exactly one PEM block")
 
 
 def policy_relative_path(
@@ -192,6 +203,80 @@ def policy_relative_path(
     identifier_hash = hashlib.sha256(policy_id.encode("ascii")).hexdigest()
     digest_hex = policy_digest.removeprefix("sha256:")
     return Path(identifier_hash, f"{policy_revision:020d}", f"{digest_hex}.json")
+
+
+class Ed25519PublicKeyLeaseVerifier:
+    """Public-key-only lease verifier for the admission data plane."""
+
+    __slots__ = ("_key_id", "_public_key", "_public_key_bytes")
+
+    def __init__(self, public_key: bytes, *, key_id: str) -> None:
+        if type(public_key) is not bytes:
+            raise TypeError("lease-authority public key must be immutable bytes")
+        if (
+            not public_key
+            or len(public_key) > MAX_PUBLIC_KEY_PEM_BYTES
+            or type(key_id) is not str
+            or _KEY_ID_RE.fullmatch(key_id) is None
+        ):
+            raise ValueError("lease-authority public key or key id is invalid")
+        try:
+            if len(public_key) == 32:
+                loaded: object = Ed25519PublicKey.from_public_bytes(public_key)
+            else:
+                _require_single_public_key_pem(public_key)
+                loaded = serialization.load_pem_public_key(public_key)
+        except (TypeError, ValueError):
+            raise ValueError("lease-authority public key could not be loaded") from None
+        if not isinstance(loaded, Ed25519PublicKey):
+            raise ValueError("lease-authority public key is not Ed25519")
+        self._key_id = key_id
+        self._public_key = loaded
+        self._public_key_bytes = loaded.public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(key_id={self._key_id!r}, "
+            f"public_key_fingerprint={self.key_fingerprint!r})"
+        )
+
+    @property
+    def key_id(self) -> str:
+        return self._key_id
+
+    @property
+    def public_key_bytes(self) -> bytes:
+        return self._public_key_bytes
+
+    @property
+    def key_fingerprint(self) -> str:
+        return _sha256(self._public_key_bytes)
+
+    def verify(self, message: bytes, signature: DetachedSignature) -> bool:
+        if (
+            type(message) is not bytes
+            or not isinstance(signature, DetachedSignature)
+            or signature.key_id != self._key_id
+            or signature.algorithm != "ed25519"
+        ):
+            return False
+        try:
+            encoded = signature.signature.encode("ascii", errors="strict")
+            decoded = base64.b64decode(encoded, validate=True)
+            if len(decoded) != 64 or base64.b64encode(decoded) != encoded:
+                return False
+            self._public_key.verify(decoded, message)
+        except (
+            InvalidSignature,
+            UnicodeEncodeError,
+            ValueError,
+            binascii.Error,
+        ):
+            return False
+        return True
 
 
 class Ed25519PEMReceiptSigner:
@@ -301,9 +386,7 @@ def _require_linux_primitives() -> None:
         or not hasattr(os, "O_DIRECTORY")
         or not Path("/proc/self/fd").is_dir()
     ):
-        raise ReferenceAdapterError(
-            "filesystem adapters require Linux no-follow openat semantics"
-        )
+        raise ReferenceAdapterError("filesystem adapters require Linux no-follow openat semantics")
 
 
 def _open_absolute_directory(path: Path) -> int:
@@ -641,8 +724,7 @@ class CustodyLimits:
             (self.max_trust_policy_bytes, MAX_TRUST_POLICY_BYTES),
         )
         if any(
-            type(value) is not int or value <= 0 or value > maximum
-            for value, maximum in configured
+            type(value) is not int or value <= 0 or value > maximum for value, maximum in configured
         ):
             raise ValueError("custody limits must be positive and no larger than profile limits")
 
@@ -732,10 +814,7 @@ def _cleanup_pending_directory(root_fd: int, name: str, identity: tuple[int, int
             os.unlink(entry, dir_fd=descriptor)
         os.fsync(descriptor)
         current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(current.st_mode)
-            or (current.st_dev, current.st_ino) != identity
-        ):
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != identity:
             raise CustodyStoreError("pending custody path changed during cleanup")
     finally:
         if descriptor >= 0:
@@ -836,9 +915,7 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
                     label="pending custody directory",
                 )
                 if not _same_object(listed, opened):
-                    raise CustodyStoreError(
-                        "pending custody path changed during observation"
-                    )
+                    raise CustodyStoreError("pending custody path changed during observation")
                 observations.append(
                     PendingCustodyObservation(
                         custody_object_id=match.group(1),
@@ -847,9 +924,7 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
                     )
                 )
             except (OSError, ReferenceAdapterError) as exc:
-                raise CustodyStoreError(
-                    "pending custody object is unavailable or unsafe"
-                ) from exc
+                raise CustodyStoreError("pending custody object is unavailable or unsafe") from exc
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
@@ -1083,9 +1158,7 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
                         label=f"custody file {name}",
                     )
                 if set(os.listdir(descriptor)) != set(_CUSTODY_FILENAMES):
-                    raise CustodyStoreError(
-                        f"custody directory entries changed during {operation}"
-                    )
+                    raise CustodyStoreError(f"custody directory entries changed during {operation}")
 
             def rehash_pinned_contents(*, operation: str) -> None:
                 # The reverse pass closes the longest window for files read
@@ -1101,9 +1174,7 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
                         label=f"custody file {name}",
                     )
                     if _sha256(payload) != expected[name]:
-                        raise CustodyStoreError(
-                            f"custody file changed during {operation}"
-                        )
+                        raise CustodyStoreError(f"custody file changed during {operation}")
 
             # Keep every descriptor open until every digest is known, then
             # check the path and exact bytes again.  Metadata alone is not an
@@ -1157,13 +1228,15 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
                 _validate_private_directory(listed, label="custody object directory")
                 _validate_private_directory(opened, label="custody object directory")
                 if not _same_object(listed, opened):
-                    raise CustodyStoreError(
-                        "custody object path changed during verification"
+                    raise CustodyStoreError("custody object path changed during verification")
+                if (
+                    required_identity is not None
+                    and (
+                        opened.st_dev,
+                        opened.st_ino,
                     )
-                if required_identity is not None and (
-                    opened.st_dev,
-                    opened.st_ino,
-                ) != required_identity:
+                    != required_identity
+                ):
                     raise CustodyStoreError(
                         "published custody object is not the verified staged directory"
                     )
@@ -1176,9 +1249,7 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
             if not self._verify_open_directory_contents(
                 descriptor,
                 expected,
-                durable_checkpoint=(
-                    durable_checkpoint if establish_durability else None
-                ),
+                durable_checkpoint=(durable_checkpoint if establish_durability else None),
             ):
                 return False
             validate_object_path()
@@ -1227,11 +1298,13 @@ class AtomicFilesystemCustodyStore(_PinnedPrivateRoot):
 __all__ = [
     "MAX_CUSTODY_RECEIPT_BYTES",
     "MAX_PRIVATE_KEY_PEM_BYTES",
+    "MAX_PUBLIC_KEY_PEM_BYTES",
     "AtomicFilesystemCustodyStore",
     "CustodyLimits",
     "CustodyStoreError",
     "DigestDirectoryTrustPolicyResolver",
     "Ed25519PEMReceiptSigner",
+    "Ed25519PublicKeyLeaseVerifier",
     "PendingCustodyObservation",
     "PolicyResolutionError",
     "ReferenceAdapterError",

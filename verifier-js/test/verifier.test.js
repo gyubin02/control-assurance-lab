@@ -728,32 +728,40 @@ test("binds an opened payload handle back to the enumerated inode", async () => 
   await writeFile(payloadPath, actual);
   await writeFile(targetPath, expected);
 
-  let running = true;
-  const turn = () => new Promise((resolve) => setImmediate(resolve));
-  const racer = (async () => {
-    while (running) {
+  const originalOpen = fsPromises.open;
+  let injected = false;
+  fsPromises.open = async (filePath, flags, ...arguments_) => {
+    if (!injected && String(filePath) === payloadPath) {
+      injected = true;
       await rename(payloadPath, heldPath);
       await rename(targetPath, payloadPath);
-      await turn();
-      await rename(payloadPath, targetPath);
-      await rename(heldPath, payloadPath);
-      await turn();
+      try {
+        return await originalOpen(filePath, flags, ...arguments_);
+      } finally {
+        await rename(payloadPath, targetPath);
+        await rename(heldPath, payloadPath);
+      }
     }
-  })();
+    return originalOpen(filePath, flags, ...arguments_);
+  };
 
-  const results = [];
+  let verification;
   try {
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      results.push(await verifyBundle(root));
-    }
+    verification = await verifyBundle(root);
   } finally {
-    running = false;
-    await racer;
+    fsPromises.open = originalOpen;
   }
 
+  assert.equal(injected, true);
+  assert.equal(verification.status, "corrupt");
   assert.equal(
-    results.some((verification) => verification.status === "integrity_verified"),
-    false,
+    verification.issues.some(
+      (entry) =>
+        entry.code === "entry-changed" &&
+        entry.detail === "payload read did not come from the enumerated file" &&
+        entry.path === "records/event.json",
+    ),
+    true,
   );
   assert.equal(sha256(await readFile(payloadPath)), sha256(actual));
 });

@@ -15,6 +15,7 @@ from assurance_lab.evidence.bundle import (
     ROOT_MEDIA_TYPE,
     SCHEMA_VERSION,
     BundleFile,
+    BundleLimits,
     BundleManifest,
     BundleStatus,
     BundleVerification,
@@ -53,8 +54,14 @@ def write_bundle(
     *,
     metadata: BundleMetadata,
     payloads: tuple[PayloadFile, ...],
+    limits: BundleLimits | None = None,
 ) -> BundleVerification:
-    """Write once, then accept the result only if the independent verifier does."""
+    """Write once, then accept the result only if the independent verifier does.
+
+    ``None`` preserves the verifier's default resource profile.  Callers with
+    an explicitly versioned evidence profile may supply its matching limits;
+    the writer never derives or widens limits implicitly from payload sizes.
+    """
 
     if destination.exists() or destination.is_symlink():
         raise BundleWriteError(f"destination already exists: {destination}")
@@ -105,7 +112,11 @@ def write_bundle(
             _write_new(target, payload.content)
         _write_new(destination / "bundle.json", manifest_bytes)
         _require_pinned_root(destination, pinned_root)
-        result = verify_bundle(destination)
+        result = (
+            verify_bundle(destination)
+            if limits is None
+            else verify_bundle(destination, limits=limits)
+        )
         _require_pinned_root(destination, pinned_root)
         if result.status != BundleStatus.INTEGRITY_VERIFIED:
             details = "; ".join(f"{issue.code}: {issue.detail}" for issue in result.issues)

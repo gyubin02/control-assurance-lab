@@ -75,6 +75,13 @@ def _public_bytes(key: Ed25519PrivateKey) -> bytes:
     )
 
 
+def _public_pem(key: Ed25519PrivateKey) -> bytes:
+    return key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
 def _write(path: Path, payload: bytes, mode: int) -> None:
     path.write_bytes(payload)
     path.chmod(mode)
@@ -173,7 +180,7 @@ class _CLISetup:
     envelope_file: Path
     cab: Path
     custody_root: Path
-    authority_key_file: Path
+    authority_public_key_file: Path
     receipt_key_file: Path
 
     def write_config(self, document: dict[str, Any] | None = None) -> None:
@@ -197,13 +204,11 @@ def _setup(tmp_path: Path, *, job_id: str = "job:e2e-0001") -> _CLISetup:
     authority_key = Ed25519PrivateKey.generate()
     receipt_key = Ed25519PrivateKey.generate()
     collector_key = Ed25519PrivateKey.generate()
-    authority_key_file = key_root / "lease-authority.pem"
+    authority_public_key_file = key_root / "lease-authority-public.pem"
     receipt_key_file = key_root / "receipt-service.pem"
-    authority_password_file = key_root / "lease-authority.password"
     receipt_password_file = key_root / "receipt-service.password"
-    _write(authority_key_file, _private_pem(authority_key, LEASE_PASSWORD), 0o600)
+    _write(authority_public_key_file, _public_pem(authority_key), 0o600)
     _write(receipt_key_file, _private_pem(receipt_key, RECEIPT_PASSWORD), 0o600)
-    _write(authority_password_file, LEASE_PASSWORD, 0o600)
     _write(receipt_password_file, RECEIPT_PASSWORD, 0o600)
 
     config: dict[str, Any] = {
@@ -213,8 +218,7 @@ def _setup(tmp_path: Path, *, job_id: str = "job:e2e-0001") -> _CLISetup:
         "expected_capability_digest": CAPABILITY_DIGEST,
         "lease_authority": {
             "key_id": "key:lease-authority-e2e",
-            "password_file": str(authority_password_file),
-            "private_key_file": str(authority_key_file),
+            "public_key_file": str(authority_public_key_file),
         },
         "ledger_file": str(ledger_root / "admission.sqlite3"),
         "policy_root": str(policy_root),
@@ -240,7 +244,7 @@ def _setup(tmp_path: Path, *, job_id: str = "job:e2e-0001") -> _CLISetup:
     manifest_digest = _digest(manifest.canonical_bytes())
     now = datetime.now(UTC)
     authority_signer = Ed25519PEMReceiptSigner(
-        authority_key_file.read_bytes(),
+        _private_pem(authority_key, LEASE_PASSWORD),
         key_id="key:lease-authority-e2e",
         password=LEASE_PASSWORD,
     )
@@ -314,7 +318,7 @@ def _setup(tmp_path: Path, *, job_id: str = "job:e2e-0001") -> _CLISetup:
         envelope_file=envelope_file,
         cab=cab,
         custody_root=custody_root,
-        authority_key_file=authority_key_file,
+        authority_public_key_file=authority_public_key_file,
         receipt_key_file=receipt_key_file,
     )
 
@@ -411,8 +415,9 @@ def test_fresh_process_roundtrip_and_exact_retry_use_real_custody(
         )
     )
     assert validated["status"] == "valid"
-    assert validated["lease_authority_key_fingerprint"] != (
-        validated["receipt_signer_key_fingerprint"]
+    assert (
+        validated["lease_authority_key_fingerprint"]
+        != (validated["receipt_signer_key_fingerprint"])
     )
 
     _install_and_register(setup)
@@ -437,9 +442,7 @@ def test_fresh_process_roundtrip_and_exact_retry_use_real_custody(
     assert admitted["status"] == "durable"
     receipt = admitted["receipt"]
     acknowledgement = admitted["custody_acknowledgement"]
-    assert acknowledgement["body"]["receipt_digest"] == _digest(
-        canonical_json_bytes(receipt)
-    )
+    assert acknowledgement["body"]["receipt_digest"] == _digest(canonical_json_bytes(receipt))
 
     object_id = receipt["body"]["custody_object_id"]
     object_root = setup.custody_root / object_id
@@ -449,9 +452,7 @@ def test_fresh_process_roundtrip_and_exact_retry_use_real_custody(
         "receipt.json",
         "trust-policy.json",
     ]
-    assert (object_root / "envelope.dsse.json").read_bytes() == (
-        setup.envelope_file.read_bytes()
-    )
+    assert (object_root / "envelope.dsse.json").read_bytes() == (setup.envelope_file.read_bytes())
     assert (object_root / "trust-policy.json").read_bytes() == setup.policy_bytes
     assert (object_root / "receipt.json").read_bytes() == canonical_json_bytes(receipt)
 
@@ -506,7 +507,7 @@ def test_committed_admission_is_reconciled_after_custody_outage(
     ("target", "expected_message"),
     [
         ("config", "admission configuration must be owner-controlled"),
-        ("authority-key", "private key must be owner-controlled"),
+        ("authority-key", "lease-authority public key must be owner-controlled"),
         ("receipt-key", "private key must be owner-controlled"),
     ],
 )
@@ -518,7 +519,7 @@ def test_private_file_permissions_fail_closed(
     setup = _setup(tmp_path)
     selected = {
         "config": setup.config_file,
-        "authority-key": setup.authority_key_file,
+        "authority-key": setup.authority_public_key_file,
         "receipt-key": setup.receipt_key_file,
     }[target]
     selected.chmod(0o644)
@@ -536,6 +537,54 @@ def test_private_file_permissions_fail_closed(
     assert expected_message in failed["error"]["message"]
 
 
+def test_legacy_private_lease_authority_config_fails_closed(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    legacy = {
+        **setup.config,
+        "lease_authority": {
+            "key_id": "key:lease-authority-e2e",
+            "private_key_file": str(setup.receipt_key_file),
+        },
+    }
+    setup.write_config(legacy)
+
+    failed = _json_error(
+        _run(
+            "admission",
+            "config",
+            "validate",
+            "--config",
+            str(setup.config_file),
+            "--json",
+        )
+    )
+
+    assert failed["error"]["code"] == "operation-invalid"
+    assert "public_key_file" in failed["error"]["message"]
+    assert "private_key_file" in failed["error"]["message"]
+
+
+def test_lease_authority_public_key_symlink_is_rejected(tmp_path: Path) -> None:
+    setup = _setup(tmp_path)
+    real_key = setup.authority_public_key_file.with_name("authority-real.pem")
+    setup.authority_public_key_file.rename(real_key)
+    setup.authority_public_key_file.symlink_to(real_key)
+
+    failed = _json_error(
+        _run(
+            "admission",
+            "config",
+            "validate",
+            "--config",
+            str(setup.config_file),
+            "--json",
+        )
+    )
+
+    assert failed["error"]["code"] == "operation-invalid"
+    assert "lease-authority public key is unavailable" in failed["error"]["message"]
+
+
 def test_changed_lease_authority_cannot_reopen_existing_ledger(
     tmp_path: Path,
 ) -> None:
@@ -543,8 +592,8 @@ def test_changed_lease_authority_cannot_reopen_existing_ledger(
     _install_and_register(setup)
     replacement = Ed25519PrivateKey.generate()
     _write(
-        setup.authority_key_file,
-        _private_pem(replacement, LEASE_PASSWORD),
+        setup.authority_public_key_file,
+        _public_pem(replacement),
         0o600,
     )
     failed = _json_error(
@@ -657,7 +706,4 @@ def test_interrupted_policy_write_never_publishes_partial_final_bytes(
     relative = policy_relative_path(POLICY_ID, POLICY_REVISION, setup.policy_digest)
     assert not (Path(setup.config["policy_root"]) / relative).exists()
     revision_root = (Path(setup.config["policy_root"]) / relative).parent
-    assert not any(
-        path.name.startswith(".pending-policy-")
-        for path in revision_root.iterdir()
-    )
+    assert not any(path.name.startswith(".pending-policy-") for path in revision_root.iterdir())

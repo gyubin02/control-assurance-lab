@@ -8,9 +8,9 @@ The command surface is intentionally split by authority:
 * admission and crash reconciliation use the same durable ledger and custody root;
 * unpublished custody staging directories can be observed, never scavenged.
 
-Private-key material and optional PEM passwords are read only from owner-private
-files named by the configuration document.  They are never accepted as command
-line arguments.
+Lease-verification public keys, receipt-signing private keys, and optional PEM
+passwords are read only from owner-controlled files named by the configuration
+document. They are never accepted as command-line arguments.
 """
 
 from __future__ import annotations
@@ -49,14 +49,16 @@ from assurance_lab.evidence.canonical import (
 )
 from assurance_lab.evidence.reference_adapters import (
     MAX_PRIVATE_KEY_PEM_BYTES,
+    MAX_PUBLIC_KEY_PEM_BYTES,
     AtomicFilesystemCustodyStore,
     DigestDirectoryTrustPolicyResolver,
     Ed25519PEMReceiptSigner,
+    Ed25519PublicKeyLeaseVerifier,
     ReferenceAdapterError,
     policy_relative_path,
 )
 
-CONFIG_MEDIA_TYPE = "application/vnd.control-assurance.admission-config.v1+json"
+CONFIG_MEDIA_TYPE = "application/vnd.control-assurance.admission-config.v2+json"
 RESULT_MEDIA_TYPE = "application/vnd.control-assurance.admission-cli-result.v1+json"
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_PASSWORD_BYTES = 4 * 1024
@@ -79,11 +81,7 @@ _DIRECTORY_FLAGS = (
 )
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _WRITE_FLAGS = (
-    os.O_RDWR
-    | os.O_CREAT
-    | os.O_EXCL
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
+    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 )
 _RENAME_NOREPLACE = 1
 
@@ -110,18 +108,33 @@ class PrivateKeyFileConfig(_StrictFrozenModel):
         return value
 
 
+class PublicKeyFileConfig(_StrictFrozenModel):
+    """Integrity-sensitive public verification key for one authority role."""
+
+    key_id: str = Field(pattern=_SAFE_IDENTIFIER_PATTERN)
+    public_key_file: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("public_key_file")
+    @classmethod
+    def path_is_absolute(cls, value: str) -> str:
+        path = Path(value)
+        if not path.is_absolute() or path.name in {"", ".", ".."}:
+            raise ValueError("public-key file path must be an absolute file path")
+        return value
+
+
 class AdmissionCLIConfig(_StrictFrozenModel):
     """Non-secret configuration for one single-node admission service."""
 
-    media_type: Literal[
-        "application/vnd.control-assurance.admission-config.v1+json"
-    ] = Field(alias="schema")
+    media_type: Literal["application/vnd.control-assurance.admission-config.v2+json"] = Field(
+        alias="schema"
+    )
     ledger_file: str = Field(min_length=1, max_length=4096)
     policy_root: str = Field(min_length=1, max_length=4096)
     custody_root: str = Field(min_length=1, max_length=4096)
     expected_audience: str = Field(pattern=_SAFE_IDENTIFIER_PATTERN)
     expected_capability_digest: str = Field(pattern=_DIGEST_PATTERN)
-    lease_authority: PrivateKeyFileConfig
+    lease_authority: PublicKeyFileConfig
     receipt_signer: PrivateKeyFileConfig
 
     @field_validator("ledger_file", "policy_root", "custody_root")
@@ -136,12 +149,11 @@ class AdmissionCLIConfig(_StrictFrozenModel):
     def paths_and_roles_are_distinct(self) -> AdmissionCLIConfig:
         files = [
             self.ledger_file,
-            self.lease_authority.private_key_file,
+            self.lease_authority.public_key_file,
             self.receipt_signer.private_key_file,
         ]
-        for key in (self.lease_authority, self.receipt_signer):
-            if key.password_file is not None:
-                files.append(key.password_file)
+        if self.receipt_signer.password_file is not None:
+            files.append(self.receipt_signer.password_file)
         if len(set(files)) != len(files):
             raise ValueError("ledger, private-key, and password files must be distinct")
         if self.policy_root == self.custody_root:
@@ -210,9 +222,7 @@ def _validate_regular_file(
 ) -> None:
     if not stat.S_ISREG(selected.st_mode) or selected.st_nlink != 1:
         raise ValueError(f"{label} must be a single-link regular file")
-    if private and (
-        selected.st_uid != os.geteuid() or stat.S_IMODE(selected.st_mode) & 0o077
-    ):
+    if private and (selected.st_uid != os.geteuid() or stat.S_IMODE(selected.st_mode) & 0o077):
         raise ValueError(f"{label} must be owner-controlled and mode 0600 or stricter")
 
 
@@ -287,11 +297,7 @@ def _read_exact_file(
         after = os.fstat(descriptor)
         listed = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         _validate_regular_file(listed, label=label, private=private)
-        if (
-            first != second
-            or not _stable_file(opened, after)
-            or not _same_file(opened, listed)
-        ):
+        if first != second or not _stable_file(opened, after) or not _same_file(opened, listed):
             raise ValueError(f"{label} changed while it was being read")
         return first
     except (OSError, ValueError) as exc:
@@ -317,6 +323,22 @@ def _load_config(path: Path) -> AdmissionCLIConfig:
     if not isinstance(document, dict):
         raise ValueError("admission configuration root must be a JSON object")
     return AdmissionCLIConfig.model_validate(document)
+
+
+def _load_lease_verifier(
+    specification: PublicKeyFileConfig,
+) -> Ed25519PublicKeyLeaseVerifier:
+    public_key_bytes = _read_exact_file(
+        Path(specification.public_key_file),
+        maximum=MAX_PUBLIC_KEY_PEM_BYTES,
+        label="lease-authority public key",
+        private=True,
+        require_private_parent=True,
+    )
+    return Ed25519PublicKeyLeaseVerifier(
+        public_key_bytes,
+        key_id=specification.key_id,
+    )
 
 
 def _load_signer(specification: PrivateKeyFileConfig) -> Ed25519PEMReceiptSigner:
@@ -383,13 +405,13 @@ def _configured_adapters(
     configuration: AdmissionCLIConfig,
 ) -> Iterator[
     tuple[
-        Ed25519PEMReceiptSigner,
+        Ed25519PublicKeyLeaseVerifier,
         Ed25519PEMReceiptSigner,
         DigestDirectoryTrustPolicyResolver,
         AtomicFilesystemCustodyStore,
     ]
 ]:
-    authority = _load_signer(configuration.lease_authority)
+    authority = _load_lease_verifier(configuration.lease_authority)
     receipt = _load_signer(configuration.receipt_signer)
     if authority.key_fingerprint == receipt.key_fingerprint:
         raise ValueError("lease authority and receipt signer require distinct key material")
@@ -465,10 +487,7 @@ def _rename_noreplace(
 
 def _unlink_pinned_name(parent: int, name: str, identity: tuple[int, int]) -> None:
     selected = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    if (
-        not stat.S_ISREG(selected.st_mode)
-        or (selected.st_dev, selected.st_ino) != identity
-    ):
+    if not stat.S_ISREG(selected.st_mode) or (selected.st_dev, selected.st_ino) != identity:
         raise ValueError("staged trust-policy path changed before cleanup")
     os.unlink(name, dir_fd=parent)
     os.fsync(parent)
@@ -524,10 +543,7 @@ def _install_policy(
             )
             os.close(current)
             current = child
-        pending_name = (
-            f".pending-policy-{digest.removeprefix('sha256:')}-"
-            f"{secrets.token_hex(16)}"
-        )
+        pending_name = f".pending-policy-{digest.removeprefix('sha256:')}-{secrets.token_hex(16)}"
         descriptor = os.open(pending_name, _WRITE_FLAGS, 0o600, dir_fd=current)
         selected = os.fstat(descriptor)
         _validate_regular_file(
@@ -545,11 +561,14 @@ def _install_policy(
             private=True,
         )
         os.lseek(descriptor, 0, os.SEEK_SET)
-        if _read_descriptor(
-            descriptor,
-            maximum=MAX_TRUST_POLICY_BYTES,
-            label="staged trust policy",
-        ) != policy_bytes:
+        if (
+            _read_descriptor(
+                descriptor,
+                maximum=MAX_TRUST_POLICY_BYTES,
+                label="staged trust policy",
+            )
+            != policy_bytes
+        ):
             raise ValueError("staged trust-policy bytes changed before publication")
         listed = os.stat(pending_name, dir_fd=current, follow_symlinks=False)
         _validate_regular_file(
@@ -591,9 +610,7 @@ def _install_policy(
             pending_name = None
             os.fsync(current)
             os.fsync(root)
-        with DigestDirectoryTrustPolicyResolver(
-            Path(configuration.policy_root)
-        ) as resolver:
+        with DigestDirectoryTrustPolicyResolver(Path(configuration.policy_root)) as resolver:
             if resolver.resolve(policy.policy_id, revision, digest) != policy_bytes:
                 raise ValueError("installed trust-policy bytes did not verify")
         return policy, digest, relative.as_posix(), created
@@ -620,7 +637,7 @@ def _install_policy(
 
 def _config_result(
     configuration: AdmissionCLIConfig,
-    authority: Ed25519PEMReceiptSigner,
+    authority: Ed25519PublicKeyLeaseVerifier,
     receipt: Ed25519PEMReceiptSigner,
 ) -> dict[str, Any]:
     return {
@@ -650,9 +667,7 @@ def _lease_result(grant: SignedJobLease) -> dict[str, Any]:
 def _admission_result(outcome: AdmissionOutcome) -> dict[str, Any]:
     return {
         "command": "admit",
-        "custody_acknowledgement": outcome.custody_acknowledgement.model_dump(
-            mode="json"
-        ),
+        "custody_acknowledgement": outcome.custody_acknowledgement.model_dump(mode="json"),
         "disposition": outcome.disposition.value,
         "media_type": RESULT_MEDIA_TYPE,
         "receipt": outcome.receipt.model_dump(mode="json"),
@@ -956,6 +971,7 @@ def add_admission_parser(commands: argparse._SubParsersAction[argparse.ArgumentP
 __all__ = [
     "AdmissionCLIConfig",
     "PrivateKeyFileConfig",
+    "PublicKeyFileConfig",
     "add_admission_parser",
     "run_admission",
 ]

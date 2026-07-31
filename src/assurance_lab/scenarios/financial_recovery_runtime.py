@@ -342,6 +342,8 @@ class FinancialRecoveryRuntimeResult:
     clone_storage_kind: str
     clone_readback_canonical: str
     clone_readback_digest: str
+    clone_cleanup_probe_canonical: str
+    clone_cleanup_probe_digest: str
     clone_cleanup_verified: bool
     events: tuple[RuntimeEvent, ...]
 
@@ -400,6 +402,7 @@ class FinancialRecoveryRuntime:
         selector: CellSelector,
         *,
         trace_id: str,
+        clone_nonce: str | None = None,
     ) -> FinancialRecoveryRuntimeResult:
         _validate_trace_id(trace_id)
         input_level = _string_level(selector.input, "input")
@@ -440,7 +443,12 @@ class FinancialRecoveryRuntime:
 
         fixture = self._cutover_fixtures[target_level]
         _validate_cutover_fixture(fixture, target_level=target_level)
-        clone_nonce = secrets.token_hex(16)
+        if clone_nonce is None:
+            clone_nonce = secrets.token_hex(16)
+        if not _CLONE_NONCE.fullmatch(clone_nonce):
+            raise ValueError(
+                "clone_nonce must be exactly 32 lowercase hexadecimal characters"
+            )
         clone_id = _clone_id(trace_id, selector, fixture, clone_nonce)
         connection = self._fresh_database(
             target_level=target_level,
@@ -741,9 +749,16 @@ class FinancialRecoveryRuntime:
 
             connection.close()
             closed = True
-            clone_cleanup_verified = _connection_is_closed(connection)
-            if not clone_cleanup_verified:
-                raise RuntimeError("fresh SQLite clone did not close after execution")
+            (
+                clone_cleanup_probe_canonical,
+                clone_cleanup_probe_digest,
+            ) = _closed_connection_probe_evidence(
+                connection,
+                trace_id=trace_id,
+                clone_id=clone_id,
+                clone_nonce=clone_nonce,
+            )
+            clone_cleanup_verified = True
         finally:
             if not closed:
                 connection.close()
@@ -755,6 +770,8 @@ class FinancialRecoveryRuntime:
             clone_storage_kind=clone_readback.storage_kind,
             clone_readback_canonical=clone_readback_canonical,
             clone_readback_digest=clone_readback_digest,
+            clone_cleanup_probe_canonical=clone_cleanup_probe_canonical,
+            clone_cleanup_probe_digest=clone_cleanup_probe_digest,
             clone_cleanup_verified=clone_cleanup_verified,
             action=action,
             action_canonical=action_canonical,
@@ -946,6 +963,8 @@ class FinancialRecoveryRuntime:
             clone_storage_kind=clone_readback.storage_kind,
             clone_readback_canonical=clone_readback_canonical,
             clone_readback_digest=clone_readback_digest,
+            clone_cleanup_probe_canonical=clone_cleanup_probe_canonical,
+            clone_cleanup_probe_digest=clone_cleanup_probe_digest,
             clone_cleanup_verified=clone_cleanup_verified,
             events=events,
         )
@@ -1665,12 +1684,30 @@ def _validate_runtime_result_consistency(
         target_level=result.target_level,
     )
     if (
+        _sha256(result.clone_cleanup_probe_canonical.encode("utf-8"))
+        != result.clone_cleanup_probe_digest
+    ):
+        raise ValueError("recovery result clone-cleanup probe digest is invalid")
+    cleanup_probe = _canonical_object(
+        result.clone_cleanup_probe_canonical,
+        label="clone cleanup probe",
+    )
+    expected_cleanup_probe = {
+        "schema": "assurance-lab.sqlite-clone-cleanup-probe/v1",
+        "trace_id": result.trace_id,
+        "clone_id": result.clone_id,
+        "clone_nonce": result.clone_nonce,
+        "probe": "execute-select-one-after-close",
+        "outcome": "closed-connection-programming-error",
+    }
+    if (
         _CLONE_NONCE.fullmatch(result.clone_nonce) is None
         or _DIGEST.fullmatch(result.clone_id) is None
         or result.clone_storage_kind != "sqlite-memory"
+        or cleanup_probe != expected_cleanup_probe
         or not result.clone_cleanup_verified
     ):
-        raise ValueError("recovery result clone identity or cleanup claim is invalid")
+        raise ValueError("recovery result clone identity or cleanup evidence is invalid")
     expected_clone_readback = CloneReadback(
         clone_id=result.clone_id,
         clone_nonce=result.clone_nonce,
@@ -2207,6 +2244,8 @@ def _validate_runtime_event_receipts(
         clone_storage_kind=result.clone_storage_kind,
         clone_readback_canonical=result.clone_readback_canonical,
         clone_readback_digest=result.clone_readback_digest,
+        clone_cleanup_probe_canonical=result.clone_cleanup_probe_canonical,
+        clone_cleanup_probe_digest=result.clone_cleanup_probe_digest,
         clone_cleanup_verified=result.clone_cleanup_verified,
         action=action,
         action_canonical=rfc8785.dumps(action).decode("utf-8"),
@@ -4215,6 +4254,8 @@ def _events(
     clone_storage_kind: str,
     clone_readback_canonical: str,
     clone_readback_digest: str,
+    clone_cleanup_probe_canonical: str,
+    clone_cleanup_probe_digest: str,
     clone_cleanup_verified: bool,
     action: dict[str, Any],
     action_canonical: str,
@@ -4601,6 +4642,8 @@ def _events(
             payload=(
                 ("clone_id", clone_id),
                 ("clone_nonce", clone_nonce),
+                ("cleanup_probe_canonical", clone_cleanup_probe_canonical),
+                ("cleanup_probe_digest", clone_cleanup_probe_digest),
                 ("connection_closed", clone_cleanup_verified),
             ),
         ),
@@ -4632,12 +4675,35 @@ def _canonical_object(canonical: str, *, label: str) -> dict[str, Any]:
     return parsed
 
 
-def _connection_is_closed(connection: sqlite3.Connection) -> bool:
+def _closed_connection_probe_evidence(
+    connection: sqlite3.Connection,
+    *,
+    trace_id: str,
+    clone_id: str,
+    clone_nonce: str,
+) -> tuple[str, str]:
+    """Record the exact post-close operation used to establish clone cleanup."""
+
     try:
         connection.execute("SELECT 1")
     except sqlite3.ProgrammingError as error:
-        return "closed" in str(error).lower()
-    return False
+        if "closed" not in str(error).lower():
+            raise RuntimeError(
+                "SQLite cleanup probe failed for a reason other than a closed connection"
+            ) from error
+    else:
+        raise RuntimeError("fresh SQLite clone remained usable after close")
+    canonical = rfc8785.dumps(
+        {
+            "schema": "assurance-lab.sqlite-clone-cleanup-probe/v1",
+            "trace_id": trace_id,
+            "clone_id": clone_id,
+            "clone_nonce": clone_nonce,
+            "probe": "execute-select-one-after-close",
+            "outcome": "closed-connection-programming-error",
+        }
+    ).decode("utf-8")
+    return canonical, _sha256(canonical.encode("utf-8"))
 
 
 _SNAPSHOT_MUTATION_TRIGGERS = frozenset(

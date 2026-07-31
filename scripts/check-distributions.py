@@ -6,22 +6,47 @@ from __future__ import annotations
 import argparse
 import email.parser
 import tarfile
+import tomllib
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from packaging.specifiers import SpecifierSet
+
 PROJECT = "control_assurance_lab"
-VERSION = "0.1.0"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+with (REPOSITORY_ROOT / "pyproject.toml").open("rb") as _project_stream:
+    _PROJECT_METADATA = tomllib.load(_project_stream)["project"]
+VERSION = str(_PROJECT_METADATA["version"])
+REQUIRES_PYTHON = str(
+    SpecifierSet(str(_PROJECT_METADATA["requires-python"]))
+)
+VERIFIER_SOURCES = {
+    "benchmark-cli.js",
+    "benchmark-verifier.js",
+    "cli.js",
+    "defender-xdr-cli.js",
+    "defender-xdr-verifier.js",
+    "elastic-security-cli.js",
+    "elastic-security-verifier.js",
+    "source-identity.js",
+    "strict-json.js",
+    "verifier.js",
+}
 WHEEL_REQUIRED = {
+    "assurance_lab/_release_assets/verifier-js/package.json",
     "assurance_lab/py.typed",
     f"{PROJECT}-{VERSION}.dist-info/entry_points.txt",
     f"{PROJECT}-{VERSION}.dist-info/licenses/LICENSE",
     f"{PROJECT}-{VERSION}.dist-info/METADATA",
+    *{f"assurance_lab/_release_assets/verifier-js/src/{name}" for name in VERIFIER_SOURCES},
 }
 SDIST_REQUIRED = {
     "LICENSE",
     "README.md",
     "pyproject.toml",
     "src/assurance_lab/py.typed",
+    "verifier-js/package.json",
+    *{f"verifier-js/src/{name}" for name in VERIFIER_SOURCES},
 }
 
 
@@ -45,22 +70,55 @@ def _check_wheel(path: Path) -> None:
         missing = WHEEL_REQUIRED - names
         if missing:
             raise ValueError(f"wheel is missing required members: {sorted(missing)!r}")
+        source_prefix = "assurance_lab/_release_assets/verifier-js/src/"
+        observed_sources = {
+            name.removeprefix(source_prefix)
+            for name in names
+            if name.startswith(source_prefix) and not name.endswith("/")
+        }
+        if observed_sources != VERIFIER_SOURCES:
+            raise ValueError(
+                "wheel verifier source set differs: "
+                f"expected={sorted(VERIFIER_SOURCES)!r}, "
+                f"observed={sorted(observed_sources)!r}"
+            )
         metadata_path = f"{PROJECT}-{VERSION}.dist-info/METADATA"
         metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_path))
         expected = {
             "Name": "control-assurance-lab",
             "Version": VERSION,
             "License-Expression": "Apache-2.0",
-            "Requires-Python": ">=3.12",
+            "Requires-Python": REQUIRES_PYTHON,
         }
         observed = {field: metadata.get(field) for field in expected}
         if observed != expected:
             raise ValueError(f"wheel metadata differs: {observed!r}")
-        entry_points = archive.read(
-            f"{PROJECT}-{VERSION}.dist-info/entry_points.txt"
-        ).decode("utf-8")
-        if "assurance-lab = assurance_lab.cli:main" not in entry_points:
-            raise ValueError("wheel does not expose the assurance-lab command")
+        entry_points = archive.read(f"{PROJECT}-{VERSION}.dist-info/entry_points.txt").decode(
+            "utf-8"
+        )
+        required_commands = {
+            "assurance-lab = assurance_lab.cli:main",
+            (
+                "assurance-control-plane = "
+                "assurance_lab.control_plane.service_cli:main"
+            ),
+            (
+                "assurance-deployment-reconciler = "
+                "assurance_lab.control_plane.reconciler_cli:main"
+            ),
+            (
+                "assurance-runtime-worker = "
+                "assurance_lab.runtime.service_cli:main"
+            ),
+        }
+        missing_commands = {
+            command for command in required_commands if command not in entry_points
+        }
+        if missing_commands:
+            raise ValueError(
+                "wheel is missing required commands: "
+                f"{sorted(missing_commands)!r}"
+            )
 
 
 def _check_sdist(path: Path) -> None:
@@ -80,6 +138,18 @@ def _check_sdist(path: Path) -> None:
         missing = SDIST_REQUIRED - relative
         if missing:
             raise ValueError(f"sdist is missing required members: {sorted(missing)!r}")
+        source_prefix = "verifier-js/src/"
+        observed_sources = {
+            name.removeprefix(source_prefix)
+            for name in relative
+            if name.startswith(source_prefix) and not name.endswith("/")
+        }
+        if observed_sources != VERIFIER_SOURCES:
+            raise ValueError(
+                "sdist verifier source set differs: "
+                f"expected={sorted(VERIFIER_SOURCES)!r}, "
+                f"observed={sorted(observed_sources)!r}"
+            )
 
 
 def main() -> int:

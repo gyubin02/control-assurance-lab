@@ -12,8 +12,13 @@ This project is pre-1.0. Security fixes are made on the default branch and
 called out in the next release. There is not yet a separate long-term support
 branch.
 
-The repository is a research system, not a hosted service. Its documented
-nonclaims—such as no WORM storage, external transparency anchor, HA consensus,
-or institutional KMS integration—are not vulnerabilities by themselves.
+The repository is a research system, not a hosted service. It contains
+reference adapters for S3 Object Lock custody, Azure Key Vault operations, and
+Vault Transit signing, together with role, journal, and deployment contracts.
+It does not provision an institution's AWS or Azure account, Vault cluster,
+database or cluster HA, retention policy, key ceremony, or external
+transparency anchor. Absence of those operator-owned services is a documented
+deployment boundary, not a vulnerability in this source tree.
+
 Behavior that contradicts a stated guarantee, accepts evidence that should
-fail closed, or exposes secrets is in scope.
+fail closed, crosses a tenant or role boundary, or exposes secrets is in scope.

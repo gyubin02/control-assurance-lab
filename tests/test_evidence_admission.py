@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -23,6 +24,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from assurance_lab.evidence.admission import (
     ADMISSION_SCHEMA_VERSION,
     COLLECTION_STATEMENT_MEDIA_TYPE,
+    CUSTODY_ACK_MEDIA_TYPE,
+    RECEIPT_MEDIA_TYPE,
     AdmissionDisposition,
     AdmissionLimits,
     AdmissionRejected,
@@ -77,6 +80,10 @@ class _Ed25519Signer:
         )
 
     @property
+    def key_id(self) -> str:
+        return self._key_id
+
+    @property
     def key_fingerprint(self) -> str:
         return _digest(self.public_key_bytes)
 
@@ -106,6 +113,75 @@ class _MisboundEd25519Signer(_Ed25519Signer):
         return _Ed25519Signer(99, "key:other-material").public_key_bytes
 
 
+class _BlockingReceiptSigner(_Ed25519Signer):
+    def __init__(
+        self,
+        *,
+        media_type: str,
+        tenant_id: str | None = None,
+    ) -> None:
+        super().__init__(2, "key:receipt-service")
+        self._media_type = media_type
+        self._tenant_id = tenant_id
+        self._blocked = False
+        self._lock = threading.Lock()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def sign(self, message: bytes) -> DetachedSignature:
+        document = json.loads(message)
+        should_block = document.get("media_type") == self._media_type and (
+            self._tenant_id is None or document.get("tenant_id") == self._tenant_id
+        )
+        with self._lock:
+            block_this_call = should_block and not self._blocked
+            if block_this_call:
+                self._blocked = True
+        if block_this_call:
+            self.entered.set()
+            if not self.release.wait(timeout=10):
+                raise TimeoutError("blocked signer was not released")
+        return super().sign(message)
+
+
+class _FailingOnceReceiptSigner(_Ed25519Signer):
+    def __init__(self, *, media_type: str) -> None:
+        super().__init__(2, "key:receipt-service")
+        self._media_type = media_type
+        self._failed = False
+
+    def sign(self, message: bytes) -> DetachedSignature:
+        document = json.loads(message)
+        if document.get("media_type") == self._media_type and not self._failed:
+            self._failed = True
+            raise TimeoutError("simulated remote signer outage")
+        return super().sign(message)
+
+
+class _SubstitutingReceiptSigner(_Ed25519Signer):
+    def __init__(self, *, media_type: str) -> None:
+        super().__init__(2, "key:receipt-service")
+        self._media_type = media_type
+
+    def sign(self, message: bytes) -> DetachedSignature:
+        document = json.loads(message)
+        if document.get("media_type") == self._media_type:
+            return super().sign(message + b"-stale")
+        return super().sign(message)
+
+
+class _MalformedReceiptSigner(_Ed25519Signer):
+    def sign(self, message: bytes) -> DetachedSignature:
+        del message
+        return cast(DetachedSignature, object())
+
+
+class _RemoteVerifyTrapSigner(_Ed25519Signer):
+    def verify(self, message: bytes, signature: DetachedSignature) -> bool:
+        del message, signature
+        raise AssertionError("adapter verification must never be called")
+
+
 class _FixedClock:
     def __init__(self, now: datetime = NOW) -> None:
         self.value = now
@@ -116,6 +192,14 @@ class _FixedClock:
         with self._lock:
             self.calls += 1
             return self.value
+
+
+class _AdvancingClock(_FixedClock):
+    def now(self) -> datetime:
+        with self._lock:
+            value = self.value + timedelta(seconds=self.calls)
+            self.calls += 1
+            return value
 
 
 class _PolicyResolver:
@@ -133,6 +217,25 @@ class _PolicyResolver:
         assert policy_revision >= 1
         assert policy_digest.startswith("sha256:")
         return self.policy_bytes
+
+
+class _BlockingPolicyResolver(_PolicyResolver):
+    def __init__(self, policy_bytes: bytes) -> None:
+        super().__init__(policy_bytes)
+        self.slow_entered = threading.Event()
+        self.release_slow = threading.Event()
+
+    def resolve(
+        self,
+        policy_id: str,
+        policy_revision: int,
+        policy_digest: str,
+    ) -> bytes:
+        if threading.current_thread().name == "slow-admission":
+            self.slow_entered.set()
+            if not self.release_slow.wait(timeout=5):
+                raise TimeoutError("slow admission was not released")
+        return super().resolve(policy_id, policy_revision, policy_digest)
 
 
 class _MemoryCustody:
@@ -479,6 +582,7 @@ def _case(
     custody: _MemoryCustody | None = None,
     clock: _FixedClock | None = None,
     limits: AdmissionLimits | None = None,
+    receipt_signer: _Ed25519Signer | None = None,
 ) -> tuple[
     AdmissionService,
     _MemoryCustody,
@@ -501,6 +605,7 @@ def _case(
         clock=clock,
         fault=fault,
         limits=limits,
+        receipt_signer=receipt_signer,
     )
     service.register_lease(grant.canonical_bytes())
     envelope = _envelope(_statement(grant), collector)
@@ -513,6 +618,42 @@ def _case(
         cab,
         grant,
         envelope,
+    )
+
+
+def _two_tenant_case(
+    tmp_path: Path,
+    *,
+    receipt_signer: _Ed25519Signer,
+) -> tuple[AdmissionService, Path, bytes, bytes]:
+    collector = _collector_key()
+    resolver = _PolicyResolver(_policy_bytes(collector))
+    cab = tmp_path / "cab"
+    manifest = _write_cab(cab)
+    slow = _grant(
+        manifest,
+        tenant_id="tenant:slow",
+        job_id="job:slow",
+        nonce_byte=31,
+    )
+    fast = _grant(
+        manifest,
+        tenant_id="tenant:fast",
+        job_id="job:fast",
+        nonce_byte=32,
+    )
+    service, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        receipt_signer=receipt_signer,
+    )
+    service.register_lease(slow.canonical_bytes())
+    service.register_lease(fast.canonical_bytes())
+    return (
+        service,
+        cab,
+        _envelope(_statement(slow), collector),
+        _envelope(_statement(fast), collector),
     )
 
 
@@ -909,6 +1050,553 @@ def test_mutated_source_after_commit_cannot_change_reconciled_custody(
     assert b"false" not in sealed_before
 
 
+def test_blocked_receipt_signer_does_not_hold_the_sqlite_writer_lock(
+    tmp_path: Path,
+) -> None:
+    signer = _BlockingReceiptSigner(
+        media_type=RECEIPT_MEDIA_TYPE,
+        tenant_id="tenant:slow",
+    )
+    service, cab, slow_envelope, fast_envelope = _two_tenant_case(
+        tmp_path,
+        receipt_signer=signer,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(
+            service.admit,
+            envelope_bytes=slow_envelope,
+            cab_source=cab,
+        )
+        assert signer.entered.wait(timeout=3)
+        fast = pool.submit(
+            service.admit,
+            envelope_bytes=fast_envelope,
+            cab_source=cab,
+        )
+        try:
+            fast_outcome = fast.result(timeout=3)
+        finally:
+            signer.release.set()
+        slow_outcome = slow.result(timeout=3)
+
+    assert fast_outcome.disposition == AdmissionDisposition.ADMITTED
+    assert slow_outcome.disposition == AdmissionDisposition.ADMITTED
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (2,)
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (0,)
+
+
+def test_blocked_ack_signer_does_not_hold_the_sqlite_writer_lock(
+    tmp_path: Path,
+) -> None:
+    signer = _BlockingReceiptSigner(media_type=CUSTODY_ACK_MEDIA_TYPE)
+    service, cab, slow_envelope, fast_envelope = _two_tenant_case(
+        tmp_path,
+        receipt_signer=signer,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(
+            service.admit,
+            envelope_bytes=slow_envelope,
+            cab_source=cab,
+        )
+        assert signer.entered.wait(timeout=3)
+        fast = pool.submit(
+            service.admit,
+            envelope_bytes=fast_envelope,
+            cab_source=cab,
+        )
+        try:
+            fast_outcome = fast.result(timeout=3)
+        finally:
+            signer.release.set()
+        slow_outcome = slow.result(timeout=3)
+
+    assert fast_outcome.disposition == AdmissionDisposition.ADMITTED
+    assert slow_outcome.disposition == AdmissionDisposition.ADMITTED
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM custody_ack_preparations").fetchone() == (
+            0,
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM admissions WHERE custody_state = 'durable'"
+        ).fetchone() == (2,)
+
+
+def test_concurrent_exact_preparation_retries_converge_to_one_receipt(
+    tmp_path: Path,
+) -> None:
+    fault = _OneShotFault(FaultPoint.AFTER_PREPARE_BEFORE_RECEIPT_SIGN)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        grant,
+        envelope,
+    ) = _case(tmp_path, fault=fault)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.admit(envelope_bytes=envelope, cab_source=cab)
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+    barrier = threading.Barrier(2)
+
+    def retry() -> AdmissionDisposition:
+        barrier.wait()
+        return recovered.admit(
+            envelope_bytes=envelope,
+            cab_source=cab,
+        ).disposition
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = (pool.submit(retry), pool.submit(retry))
+        dispositions = sorted(
+            (outcome.result(timeout=5) for outcome in outcomes),
+            key=lambda value: value.value,
+        )
+
+    assert dispositions == [
+        AdmissionDisposition.ADMITTED,
+        AdmissionDisposition.EXACT_RETRY,
+    ]
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (0,)
+        assert connection.execute(
+            """
+            SELECT consumed_envelope_digest IS NOT NULL,
+                   consumed_receipt_digest IS NOT NULL
+            FROM job_leases WHERE lease_digest = ?
+            """,
+            (grant.lease.lease_digest(),),
+        ).fetchone() == (1, 1)
+
+
+def test_prepared_receipt_is_a_same_tenant_tail_barrier(
+    tmp_path: Path,
+) -> None:
+    fault = _OneShotFault(FaultPoint.AFTER_PREPARE_BEFORE_RECEIPT_SIGN)
+    (
+        service,
+        _custody,
+        clock,
+        _resolver,
+        collector,
+        cab,
+        first,
+        first_envelope,
+    ) = _case(tmp_path, fault=fault)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.admit(envelope_bytes=first_envelope, cab_source=cab)
+    second = _next_grant(first, sequence=2, nonce_byte=33)
+    service.register_lease(second.canonical_bytes())
+    clock.value += timedelta(seconds=1)
+
+    reason = _reason(
+        lambda: service.admit(
+            envelope_bytes=_envelope(_statement(second), collector),
+            cab_source=cab,
+        )
+    )
+
+    assert reason == AdmissionRejectReason.CUSTODY_UNAVAILABLE
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (0,)
+
+
+def test_signature_verification_uses_only_the_pinned_local_public_key(
+    tmp_path: Path,
+) -> None:
+    signer = _RemoteVerifyTrapSigner(2, "key:receipt-service")
+    service, _custody, _clock, _resolver, _collector, cab, _grant_value, envelope = _case(
+        tmp_path,
+        receipt_signer=signer,
+    )
+
+    outcome = service.admit(envelope_bytes=envelope, cab_source=cab)
+
+    assert outcome.disposition == AdmissionDisposition.ADMITTED
+
+
+def test_receipt_signer_outage_reserves_exact_request_without_consuming_lease(
+    tmp_path: Path,
+) -> None:
+    signer = _FailingOnceReceiptSigner(media_type=RECEIPT_MEDIA_TYPE)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        grant,
+        envelope,
+    ) = _case(tmp_path, receipt_signer=signer)
+
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.SIGNER_UNAVAILABLE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (1,)
+        assert connection.execute(
+            """
+            SELECT consumed_envelope_digest, consumed_receipt_digest
+            FROM job_leases WHERE lease_digest = ?
+            """,
+            (grant.lease.lease_digest(),),
+        ).fetchone() == (None, None)
+
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+    outcome = recovered.admit(envelope_bytes=envelope, cab_source=cab)
+
+    assert outcome.disposition == AdmissionDisposition.ADMITTED
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (0,)
+
+
+def test_prepared_receipt_reconciles_without_the_original_cab_or_policy_resolver(
+    tmp_path: Path,
+) -> None:
+    signer = _FailingOnceReceiptSigner(media_type=RECEIPT_MEDIA_TYPE)
+    (
+        service,
+        custody,
+        clock,
+        _resolver,
+        _collector,
+        cab,
+        _grant_value,
+        envelope,
+    ) = _case(tmp_path, receipt_signer=signer)
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.SIGNER_UNAVAILABLE
+    )
+    for child in sorted(cab.rglob("*"), reverse=True):
+        if child.is_file():
+            child.unlink()
+        else:
+            child.rmdir()
+    cab.rmdir()
+    unavailable_resolver = _PolicyResolver(b"must not be resolved")
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=unavailable_resolver,
+        custody=custody,
+        clock=clock,
+    )
+
+    assert recovered.reconcile_pending() == 1
+    assert unavailable_resolver.calls == []
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (0,)
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("durable",)
+
+
+def test_ack_signer_outage_leaves_recoverable_pending_ack_preparation(
+    tmp_path: Path,
+) -> None:
+    signer = _FailingOnceReceiptSigner(media_type=CUSTODY_ACK_MEDIA_TYPE)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        _grant_value,
+        envelope,
+    ) = _case(tmp_path, receipt_signer=signer)
+
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.SIGNER_UNAVAILABLE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("pending",)
+        assert connection.execute("SELECT count(*) FROM custody_ack_preparations").fetchone() == (
+            1,
+        )
+
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+
+    assert recovered.reconcile_pending() == 1
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("durable",)
+        assert connection.execute("SELECT count(*) FROM custody_ack_preparations").fetchone() == (
+            0,
+        )
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        FaultPoint.AFTER_PREPARE_BEFORE_RECEIPT_SIGN,
+        FaultPoint.AFTER_RECEIPT_SIGN_BEFORE_FINALIZE,
+    ),
+)
+def test_receipt_signing_crash_boundaries_resume_the_exact_preparation(
+    tmp_path: Path,
+    point: FaultPoint,
+) -> None:
+    fault = _OneShotFault(point)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        _grant_value,
+        envelope,
+    ) = _case(tmp_path, fault=fault)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.admit(envelope_bytes=envelope, cab_source=cab)
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (0,)
+
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+    outcome = recovered.admit(envelope_bytes=envelope, cab_source=cab)
+
+    assert outcome.disposition == AdmissionDisposition.ADMITTED
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    "point",
+    (
+        FaultPoint.AFTER_ACK_PREPARE_BEFORE_SIGN,
+        FaultPoint.AFTER_ACK_SIGN_BEFORE_FINALIZE,
+    ),
+)
+def test_ack_signing_crash_boundaries_resume_the_exact_preparation(
+    tmp_path: Path,
+    point: FaultPoint,
+) -> None:
+    fault = _OneShotFault(point)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        _grant_value,
+        envelope,
+    ) = _case(tmp_path, fault=fault)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.admit(envelope_bytes=envelope, cab_source=cab)
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("pending",)
+        assert connection.execute("SELECT count(*) FROM custody_ack_preparations").fetchone() == (
+            1,
+        )
+
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+
+    assert recovered.reconcile_pending() == 1
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("durable",)
+        assert connection.execute("SELECT count(*) FROM custody_ack_preparations").fetchone() == (
+            0,
+        )
+
+
+def test_substituted_receipt_signature_cannot_finalize_a_preparation(
+    tmp_path: Path,
+) -> None:
+    signer = _SubstitutingReceiptSigner(media_type=RECEIPT_MEDIA_TYPE)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        _grant_value,
+        envelope,
+    ) = _case(tmp_path, receipt_signer=signer)
+
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (0,)
+
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+    assert (
+        recovered.admit(envelope_bytes=envelope, cab_source=cab).disposition
+        == AdmissionDisposition.ADMITTED
+    )
+
+
+def test_substituted_ack_signature_cannot_finalize_a_preparation(
+    tmp_path: Path,
+) -> None:
+    signer = _SubstitutingReceiptSigner(media_type=CUSTODY_ACK_MEDIA_TYPE)
+    (
+        service,
+        custody,
+        clock,
+        resolver,
+        _collector,
+        cab,
+        _grant_value,
+        envelope,
+    ) = _case(tmp_path, receipt_signer=signer)
+
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("pending",)
+        assert connection.execute("SELECT count(*) FROM custody_ack_preparations").fetchone() == (
+            1,
+        )
+
+    recovered, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        custody=custody,
+        clock=clock,
+    )
+    assert recovered.reconcile_pending() == 1
+
+
+def test_malformed_signer_result_cannot_finalize_a_preparation(
+    tmp_path: Path,
+) -> None:
+    signer = _MalformedReceiptSigner(2, "key:receipt-service")
+    service, _custody, _clock, _resolver, _collector, cab, _grant_value, envelope = _case(
+        tmp_path,
+        receipt_signer=signer,
+    )
+
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admission_preparations").fetchone() == (1,)
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (0,)
+
+
+def test_tampered_receipt_preparation_fails_closed_on_restart(
+    tmp_path: Path,
+) -> None:
+    signer = _FailingOnceReceiptSigner(media_type=RECEIPT_MEDIA_TYPE)
+    service, custody, clock, resolver, _collector, cab, _grant_value, envelope = _case(
+        tmp_path,
+        receipt_signer=signer,
+    )
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.SIGNER_UNAVAILABLE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        original = bytes(
+            connection.execute("SELECT receipt_body_bytes FROM admission_preparations").fetchone()[
+                0
+            ]
+        )
+        connection.execute(
+            "UPDATE admission_preparations SET receipt_body_bytes = ?",
+            (original + b"\x00",),
+        )
+
+    with pytest.raises(RuntimeError, match="history validation failed"):
+        _service(
+            tmp_path,
+            resolver=resolver,
+            custody=custody,
+            clock=clock,
+        )
+
+
+def test_tampered_ack_preparation_fails_closed_on_restart(
+    tmp_path: Path,
+) -> None:
+    signer = _FailingOnceReceiptSigner(media_type=CUSTODY_ACK_MEDIA_TYPE)
+    service, custody, clock, resolver, _collector, cab, _grant_value, envelope = _case(
+        tmp_path,
+        receipt_signer=signer,
+    )
+    assert (
+        _reason(lambda: service.admit(envelope_bytes=envelope, cab_source=cab))
+        == AdmissionRejectReason.SIGNER_UNAVAILABLE
+    )
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        original = bytes(
+            connection.execute(
+                """
+                SELECT acknowledgement_body_bytes
+                FROM custody_ack_preparations
+                """
+            ).fetchone()[0]
+        )
+        connection.execute(
+            """
+            UPDATE custody_ack_preparations
+            SET acknowledgement_body_bytes = ?
+            """,
+            (original + b"\x00",),
+        )
+
+    with pytest.raises(RuntimeError, match="history validation failed"):
+        _service(
+            tmp_path,
+            resolver=resolver,
+            custody=custody,
+            clock=clock,
+        )
+
+
 @pytest.mark.parametrize(
     "point",
     (
@@ -1135,6 +1823,81 @@ def test_clock_is_read_once_and_rollback_fails_closed(tmp_path: Path) -> None:
 
     assert reason == AdmissionRejectReason.CLOCK_ROLLBACK
     assert clock.calls == 2
+
+
+def test_concurrent_unrelated_tenants_take_time_at_serialized_append(
+    tmp_path: Path,
+) -> None:
+    collector = _collector_key()
+    resolver = _BlockingPolicyResolver(_policy_bytes(collector))
+    clock = _AdvancingClock()
+    cab = tmp_path / "cab"
+    manifest = _write_cab(cab)
+    slow_grant = _grant(
+        manifest,
+        tenant_id="tenant:slow",
+        job_id="job:slow",
+        nonce_byte=20,
+    )
+    fast_grant = _grant(
+        manifest,
+        tenant_id="tenant:fast",
+        job_id="job:fast",
+        nonce_byte=21,
+    )
+    service, _custody, _clock = _service(
+        tmp_path,
+        resolver=resolver,
+        clock=clock,
+    )
+    service.register_lease(slow_grant.canonical_bytes())
+    service.register_lease(fast_grant.canonical_bytes())
+    results: dict[str, AdmissionDisposition | AdmissionRejectReason] = {}
+    admitted_at: dict[str, str] = {}
+
+    def admit(name: str, grant: SignedJobLease) -> None:
+        try:
+            outcome = service.admit(
+                envelope_bytes=_envelope(_statement(grant), collector),
+                cab_source=cab,
+            )
+            results[name] = outcome.disposition
+            admitted_at[name] = outcome.receipt.body.admitted_at
+        except AdmissionRejected as exc:
+            results[name] = exc.reason
+
+    slow = threading.Thread(
+        target=admit,
+        args=("slow", slow_grant),
+        name="slow-admission",
+    )
+    fast = threading.Thread(
+        target=admit,
+        args=("fast", fast_grant),
+        name="fast-admission",
+    )
+    slow.start()
+    assert resolver.slow_entered.wait(timeout=5)
+    try:
+        fast.start()
+        fast.join(timeout=5)
+        assert not fast.is_alive()
+    finally:
+        resolver.release_slow.set()
+    slow.join(timeout=5)
+
+    assert not slow.is_alive()
+    assert results == {
+        "fast": AdmissionDisposition.ADMITTED,
+        "slow": AdmissionDisposition.ADMITTED,
+    }
+    assert clock.calls == 2
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM admissions").fetchone() == (2,)
+    assert admitted_at == {
+        "fast": "2026-07-29T12:00:00.000000Z",
+        "slow": "2026-07-29T12:00:01.000000Z",
+    }
 
 
 def test_expired_lease_cannot_be_backdated_by_the_caller(tmp_path: Path) -> None:
@@ -1602,6 +2365,29 @@ def test_resource_limit_fails_before_envelope_parsing(tmp_path: Path) -> None:
     )
 
 
+def test_prepare_finalize_transitions_do_not_double_count_committed_wal(
+    tmp_path: Path,
+) -> None:
+    limits = AdmissionLimits(max_database_bytes=400_000)
+    service, _custody, _clock, _resolver, _collector, cab, _grant_value, envelope = _case(
+        tmp_path,
+        limits=limits,
+    )
+
+    outcome = service.admit(envelope_bytes=envelope, cab_source=cab)
+
+    assert outcome.disposition == AdmissionDisposition.ADMITTED
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        assert connection.execute("SELECT custody_state FROM admissions").fetchone() == ("durable",)
+        assert connection.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM admission_preparations),
+                (SELECT count(*) FROM custody_ack_preparations)
+            """
+        ).fetchone() == (0, 0)
+
+
 def test_tenant_quota_rolls_back_the_second_admission(tmp_path: Path) -> None:
     limits = AdmissionLimits(max_admissions_per_tenant=1)
     (
@@ -1897,6 +2683,19 @@ def test_database_quota_applies_at_startup(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="configured byte quota"):
         _service(tmp_path, resolver=resolver, limits=limits)
+
+
+def test_preparation_schema_rejects_an_older_internal_ledger_version(
+    tmp_path: Path,
+) -> None:
+    collector = _collector_key()
+    resolver = _PolicyResolver(_policy_bytes(collector))
+    _service(tmp_path, resolver=resolver)
+    with sqlite3.connect(_database(tmp_path)) as connection:
+        connection.execute("UPDATE admission_meta SET schema_version = '2.0.0' WHERE singleton = 1")
+
+    with pytest.raises(RuntimeError, match="unsupported or malformed"):
+        _service(tmp_path, resolver=resolver)
 
 
 def test_cab_manifest_identity_must_match_signed_statement(tmp_path: Path) -> None:

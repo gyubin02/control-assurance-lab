@@ -302,7 +302,8 @@ def verify_cab_snapshot(
         raise CABSnapshotError("CAB snapshot must contain one leading bundle.json")
     with tempfile.TemporaryDirectory(prefix="assurance-cab-snapshot-") as temporary:
         root = Path(temporary)
-        os.chmod(root, 0o700)
+        # Snapshot material is intentionally confined to the current user.
+        os.chmod(root, 0o700)  # nosemgrep
         _write_snapshot_tree(root, entries)
         verification = verify_bundle(
             root,

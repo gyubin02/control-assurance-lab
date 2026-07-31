@@ -262,7 +262,7 @@ def test_quarantine_effect_does_not_depend_on_exact_revocation(
 
 @pytest.mark.parametrize(
     ("target_effective", "quarantine_on", "sham_reload"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_unrelated_principal_survives_the_full_benign_envelope(
     target_effective: bool,
@@ -292,7 +292,7 @@ def test_unrelated_principal_survives_the_full_benign_envelope(
 
 @pytest.mark.parametrize(
     ("attack", "target_effective", "quarantine_on"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_responder_reload_is_a_behavior_free_sham(
     attack: bool,

@@ -1,0 +1,231 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-assurance-control-plane
+  namespace: control-assurance
+  annotations:
+    azure.workload.identity/client-id: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+    azure.workload.identity/tenant-id: 11111111-2222-4333-8444-555555555555
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-assurance-control-plane
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 2
+  minReadySeconds: 15
+  progressDeadlineSeconds: 600
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-assurance
+        app.kubernetes.io/component: control-plane
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: control-assurance-control-plane
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 2000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: control-assurance
+                  app.kubernetes.io/component: control-plane
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-assurance
+              app.kubernetes.io/component: control-plane
+      containers:
+        - name: control-plane
+          image: ghcr.io/gyubin02/control-assurance-lab@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          command:
+            - assurance-control-plane
+          args:
+            - run
+            - --config
+            - /etc/control-assurance/config/service.json
+          env:
+            - name: ASSURANCE_CONTROL_PLANE_CONFIG_DIGEST
+              value: sha256:d1f33835c7b121c8d6689571fb9162de4818b90a6a86864031c18c7be1cea906
+            - name: ASSURANCE_CONTROL_PLANE_CONTROL_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-control-plane-postgres
+                  key: control-dsn
+            - name: ASSURANCE_CONTROL_PLANE_AUTH_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-control-plane-postgres
+                  key: auth-dsn
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: assurance.example.test
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: assurance.example.test
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: assurance.example.test
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/control-assurance/config
+              readOnly: true
+            - name: trust
+              mountPath: /etc/control-assurance/trust
+              readOnly: true
+            - name: oidc-client-identity
+              mountPath: /etc/control-assurance/identity
+              readOnly: true
+            - name: azure-workload-token
+              mountPath: /var/run/control-assurance/azure
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: control-assurance-control-plane-config
+            defaultMode: 288
+            items:
+              - key: service.json
+                path: service.json
+        - name: trust
+          projected:
+            defaultMode: 288
+            sources:
+              - configMap:
+                  name: control-assurance-control-plane-trust
+                  items:
+                    - key: postgres-ca.pem
+                      path: postgres-ca.pem
+                    - key: oidc-ca.pem
+                      path: oidc-ca.pem
+                    - key: key-vault-ca.pem
+                      path: key-vault-ca.pem
+        - name: oidc-client-identity
+          projected:
+            defaultMode: 288
+            sources:
+              - secret:
+                  name: control-assurance-oidc-client-certificate
+                  items:
+                    - key: oidc-client.der
+                      path: oidc-client.der
+        - name: azure-workload-token
+          projected:
+            defaultMode: 288
+            sources:
+              - serviceAccountToken:
+                  audience: api://AzureADTokenExchange
+                  expirationSeconds: 3600
+                  path: token
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-assurance-control-plane
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: control-assurance-control-plane
+  namespace: control-assurance
+spec:
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: IfHealthyBudget
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance
+      app.kubernetes.io/component: control-plane

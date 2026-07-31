@@ -11,6 +11,7 @@ from pathlib import Path
 
 from assurance_lab._version import __version__
 from assurance_lab.admission_cli import add_admission_parser, run_admission
+from assurance_lab.benchmark_cli import add_benchmark_parser, run_benchmark_release
 from assurance_lab.contract import (
     EvidencePolicyRef,
     EvidenceWindow,
@@ -60,6 +61,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.command == "admission":
             return run_admission(arguments)
+        if arguments.command == "benchmark":
+            return run_benchmark_release(arguments)
         if arguments.command == "dsse":
             return run_dsse_verify(
                 envelope_path=Path(arguments.envelope),
@@ -139,6 +142,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     snapshot_verify.add_argument("snapshot")
     snapshot_verify.add_argument("--json", action="store_true", help="emit canonical JSON")
+    add_benchmark_parser(commands)
     add_admission_parser(commands)
     return parser
 

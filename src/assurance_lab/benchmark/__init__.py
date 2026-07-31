@@ -32,6 +32,11 @@ from assurance_lab.benchmark.corruption_sources import (
     build_real_corruption_source_corpus,
     copy_real_corruption_members,
 )
+from assurance_lab.benchmark.generator import (
+    GeneratedPublicBenchmark,
+    GeneratedScenarioSource,
+    build_public_benchmark,
+)
 from assurance_lab.benchmark.models import (
     BENCHMARK_SCENARIO_IDS,
     CELLS_PER_BENCHMARK,
@@ -81,6 +86,17 @@ from assurance_lab.benchmark.release import (
     AdmittedBenchmarkRelease,
     admit_benchmark_release,
 )
+from assurance_lab.benchmark.release_builder import (
+    PublicReleaseError,
+    PublicReleaseManifest,
+    PublicReleaseSummary,
+    PublishedBenchmarkRelease,
+    SemanticVerificationReceipt,
+    VerifiedPublicRelease,
+    VerifierSourceIdentity,
+    build_public_release,
+    verify_public_release,
+)
 
 __all__ = [
     "BENCHMARK_JSON_LIMITS",
@@ -121,12 +137,18 @@ __all__ = [
     "FrozenPlan",
     "FrozenPlanEntry",
     "FrozenSpecificationAction",
+    "GeneratedPublicBenchmark",
+    "GeneratedScenarioSource",
     "IndexedCorruptionCorpus",
     "IssueDisposition",
     "ManifestPolicy",
     "MutationOperation",
     "NormalizedIssue",
     "OpaqueArtifactReference",
+    "PublicReleaseError",
+    "PublicReleaseManifest",
+    "PublicReleaseSummary",
+    "PublishedBenchmarkRelease",
     "RawTrialEnvelope",
     "RawTrialSet",
     "RealCorruptionSourceCorpus",
@@ -137,11 +159,16 @@ __all__ = [
     "ScenarioSemanticResult",
     "ScenarioVerifier",
     "SemanticVector",
+    "SemanticVerificationReceipt",
     "SourceBundleResolver",
     "TrialSemanticResult",
+    "VerifiedPublicRelease",
+    "VerifierSourceIdentity",
     "admit_benchmark_release",
     "admit_raw_benchmark",
     "benchmark_corpus_digest",
+    "build_public_benchmark",
+    "build_public_release",
     "build_real_corruption_source_corpus",
     "canonical_digest",
     "canonical_model_bytes",
@@ -154,4 +181,5 @@ __all__ = [
     "revalidate_benchmark_value",
     "verify_benchmark_semantics",
     "verify_corruption_corpus",
+    "verify_public_release",
 ]

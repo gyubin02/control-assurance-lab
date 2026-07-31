@@ -19,6 +19,7 @@ import assurance_lab.evidence.reference_adapters as adapters
 from assurance_lab.evidence.admission import (
     CustodyStore,
     DetachedSignature,
+    LeaseAuthorityVerifier,
     ReceiptSigner,
     TrustPolicyResolver,
 )
@@ -34,6 +35,7 @@ from assurance_lab.evidence.reference_adapters import (
     CustodyStoreError,
     DigestDirectoryTrustPolicyResolver,
     Ed25519PEMReceiptSigner,
+    Ed25519PublicKeyLeaseVerifier,
     PolicyResolutionError,
     ReferenceAdapterError,
     policy_relative_path,
@@ -75,6 +77,13 @@ def _private_pem(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         encryption,
+    )
+
+
+def _public_pem(key: Ed25519PrivateKey) -> bytes:
+    return key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
 
@@ -204,6 +213,61 @@ def _verify(
     )
 
 
+def test_lease_verifier_accepts_raw_or_spki_public_key_but_cannot_sign() -> None:
+    key = Ed25519PrivateKey.from_private_bytes(bytes([6]) * 32)
+    signer = Ed25519PEMReceiptSigner(
+        _private_pem(key),
+        key_id="key:lease-authority",
+    )
+    message = b"canonical signed lease bytes"
+    signature = signer.sign(message)
+    raw = key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+
+    for material in (raw, _public_pem(key)):
+        verifier = Ed25519PublicKeyLeaseVerifier(
+            material,
+            key_id="key:lease-authority",
+        )
+        protocol_verifier: LeaseAuthorityVerifier = verifier
+        assert protocol_verifier.public_key_bytes == raw
+        assert verifier.verify(message, signature)
+        assert not verifier.verify(message + b"!", signature)
+        assert not hasattr(verifier, "sign")
+        assert verifier.key_fingerprint in repr(verifier)
+
+
+def test_lease_verifier_rejects_private_non_ed25519_and_ambiguous_pem() -> None:
+    key = Ed25519PrivateKey.generate()
+    public_pem = _public_pem(key)
+    rsa_public_pem = (
+        generate_private_key(public_exponent=65537, key_size=2048)
+        .public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+
+    for material in (
+        _private_pem(key),
+        public_pem + public_pem,
+        public_pem + b"TRAILING-JUNK",
+    ):
+        with pytest.raises(ValueError, match="could not be loaded"):
+            Ed25519PublicKeyLeaseVerifier(
+                material,
+                key_id="key:lease-authority",
+            )
+    with pytest.raises(ValueError, match="not Ed25519"):
+        Ed25519PublicKeyLeaseVerifier(
+            rsa_public_pem,
+            key_id="key:lease-authority",
+        )
+
+
 def test_pem_signer_loads_encrypted_pkcs8_and_emits_canonical_signature() -> None:
     password = b"caller-owned-password"
     signer, _pem = _signer(password=password)
@@ -216,9 +280,7 @@ def test_pem_signer_loads_encrypted_pkcs8_and_emits_canonical_signature() -> Non
     assert signature.algorithm == "ed25519"
     assert signature.key_id == "key:receipt-reference"
     assert len(base64.b64decode(signature.signature, validate=True)) == 64
-    assert base64.b64encode(base64.b64decode(signature.signature)).decode() == (
-        signature.signature
-    )
+    assert base64.b64encode(base64.b64decode(signature.signature)).decode() == (signature.signature)
     assert signer.verify(message, signature)
     assert not signer.verify(message + b"!", signature)
     assert not signer.verify(
@@ -477,9 +539,7 @@ def test_policy_read_stays_on_pinned_fd_and_rejects_mid_read_root_swap(
     resolver.close()
 
     assert swapped
-    assert (
-        moved / policy_relative_path(policy_id, 1, digest)
-    ).read_bytes() == policy_bytes
+    assert (moved / policy_relative_path(policy_id, 1, digest)).read_bytes() == policy_bytes
 
 
 def test_custody_publishes_one_private_exact_object_and_retries_idempotently(

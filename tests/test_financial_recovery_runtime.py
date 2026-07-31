@@ -399,6 +399,25 @@ def test_all_sixteen_cells_run_from_fresh_sqlite_clones(
     assert all(result.prior_disclosure_reference_unchanged for result in results)
     assert all(result.clone_cleanup_verified for result in results)
     assert all(
+        recovery_runtime_module._sha256(
+            result.clone_cleanup_probe_canonical.encode("utf-8")
+        )
+        == result.clone_cleanup_probe_digest
+        for result in results
+    )
+    assert all(
+        json.loads(result.clone_cleanup_probe_canonical)
+        == {
+            "schema": "assurance-lab.sqlite-clone-cleanup-probe/v1",
+            "trace_id": result.trace_id,
+            "clone_id": result.clone_id,
+            "clone_nonce": result.clone_nonce,
+            "probe": "execute-select-one-after-close",
+            "outcome": "closed-connection-programming-error",
+        }
+        for result in results
+    )
+    assert all(
         result.prior_admitted_disclosure_count_before
         == result.prior_admitted_disclosure_count_after
         == 2
@@ -539,7 +558,7 @@ def test_approved_snapshot_stops_selection_before_the_release_gateway(
 
 @pytest.mark.parametrize(
     ("target_effective", "guard_on", "sham_reapply"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_all_eight_benign_cells_preserve_one_row_of_legitimate_service(
     runtime: FinancialRecoveryRuntime,
@@ -572,7 +591,7 @@ def test_all_eight_benign_cells_preserve_one_row_of_legitimate_service(
 
 @pytest.mark.parametrize(
     ("attack", "target_effective", "guard_on"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_snapshot_reapply_is_a_behavior_free_sham(
     runtime: FinancialRecoveryRuntime,
@@ -1512,6 +1531,44 @@ def test_assessment_rejects_coherently_rewritten_clone_identity(
         assess_recovery_case(rewrite(attack), rewrite(benign))
 
 
+def test_assessment_rejects_a_forged_clone_cleanup_summary(
+    runtime: FinancialRecoveryRuntime,
+) -> None:
+    attack = runtime.execute(
+        _selector(attack=True, target_effective=True, guard_on=True),
+        trace_id="forged-cleanup-probe-attack",
+    )
+    benign = runtime.execute(
+        _selector(attack=False, target_effective=True, guard_on=True),
+        trace_id="forged-cleanup-probe-benign",
+    )
+
+    def rewrite(result: FinancialRecoveryRuntimeResult) -> FinancialRecoveryRuntimeResult:
+        forged = json.loads(result.clone_cleanup_probe_canonical)
+        forged["outcome"] = "producer-claimed-closed"
+        canonical = rfc8785.dumps(forged).decode("utf-8")
+        digest = recovery_runtime_module._sha256(canonical.encode("utf-8"))
+        events = list(result.events)
+        events[-1] = _event_with_updates(
+            events[-1],
+            {
+                "cleanup_probe_canonical": canonical,
+                "cleanup_probe_digest": digest,
+                "connection_closed": True,
+            },
+        )
+        return replace(
+            result,
+            clone_cleanup_probe_canonical=canonical,
+            clone_cleanup_probe_digest=digest,
+            clone_cleanup_verified=True,
+            events=tuple(events),
+        )
+
+    with pytest.raises(ValueError, match="cleanup evidence"):
+        assess_recovery_case(rewrite(attack), rewrite(benign))
+
+
 def test_assessment_rejects_coherently_forged_snapshot_apply_receipt(
     runtime: FinancialRecoveryRuntime,
 ) -> None:
@@ -1664,13 +1721,23 @@ def test_cleanup_attestation_failure_is_not_reported_as_success(
     runtime: FinancialRecoveryRuntime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def reject_cleanup_probe(
+        _connection: sqlite3.Connection,
+        *,
+        trace_id: str,
+        clone_id: str,
+        clone_nonce: str,
+    ) -> tuple[str, str]:
+        del trace_id, clone_id, clone_nonce
+        raise RuntimeError("fresh SQLite clone remained usable after close")
+
     monkeypatch.setattr(
         recovery_runtime_module,
-        "_connection_is_closed",
-        lambda _connection: False,
+        "_closed_connection_probe_evidence",
+        reject_cleanup_probe,
     )
 
-    with pytest.raises(RuntimeError, match="did not close"):
+    with pytest.raises(RuntimeError, match="remained usable"):
         runtime.execute(
             _selector(attack=True, target_effective=False, guard_on=True),
             trace_id="cleanup-attestation-failure",

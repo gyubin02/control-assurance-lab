@@ -4,13 +4,15 @@ The public boundary accepts only raw inputs.  It does not accept a caller's
 claim that a signature, policy, CAB, signer identity, or timestamp was already
 verified.  ``AdmissionService`` reads its clock once, resolves policy through a
 configured authority, verifies the DSSE payload and exact CAB snapshot, and
-then asks the private SQLite ledger to perform one state transition.
+then asks the private SQLite ledger to reserve and finalize one state
+transition.
 
 SQLite remains the R1 single-node reference.  WAL + FULL synchronous commits
 and explicit crash recovery are useful, but they are not HA, an external
 transparency log, a privileged-operator rollback anchor, or WORM custody.  The
-receipt signer is still called while a SQLite write lock is held; a production
-KMS adapter therefore needs a bounded latency contract.
+receipt signer is called only after a durable preparation commits and before a
+compare-and-finalize transaction begins. A slow or unavailable remote signer
+therefore leaves retryable state without holding the SQLite writer lock.
 """
 
 from __future__ import annotations
@@ -62,6 +64,7 @@ from assurance_lab.evidence.snapshot import (
     CABSnapshotError,
     SealedCABSnapshot,
     capture_cab_snapshot,
+    verify_cab_snapshot,
 )
 
 LEASE_MEDIA_TYPE: Literal["application/vnd.control-assurance.job-lease.v2+json"] = (
@@ -81,6 +84,7 @@ CUSTODY_ACK_MEDIA_TYPE: Literal["application/vnd.control-assurance.custody-ack.v
 )
 ADMISSION_SCHEMA_VERSION: Literal["2.0.0"] = "2.0.0"
 CUSTODY_ACK_SCHEMA_VERSION: Literal["1.0.0"] = "1.0.0"
+_LEDGER_SCHEMA_VERSION: Literal["3.0.0"] = "3.0.0"
 MINIMUM_NONCE_BYTES = 32
 
 _TIMESTAMP_PATTERN = re.compile(
@@ -547,6 +551,7 @@ class AdmissionRejectReason(StrEnum):
     CLOCK_ROLLBACK = "clock-rollback"
     RESOURCE_LIMIT_EXCEEDED = "resource-limit-exceeded"
     QUOTA_EXCEEDED = "quota-exceeded"
+    SIGNER_UNAVAILABLE = "signer-unavailable"
     INVALID_RECEIPT_SIGNATURE = "invalid-receipt-signature"
     CUSTODY_UNAVAILABLE = "custody-unavailable"
     INTERNAL_INTEGRITY_ERROR = "internal-integrity-error"
@@ -562,18 +567,25 @@ class AdmissionRejected(ValueError):
         self.detail = detail
 
 
-class ReceiptSigner(Protocol):
+class LeaseAuthorityVerifier(Protocol):
+    @property
+    def key_id(self) -> str:
+        """Stable key label bound to every detached signature."""
+        ...
+
     @property
     def public_key_bytes(self) -> bytes:
         """Immutable canonical 32-byte raw Ed25519 public key."""
         ...
 
+
+class ReceiptSigner(LeaseAuthorityVerifier, Protocol):
+    """Concurrent signer boundary; implementations must be thread-safe."""
+
     def sign(self, message: bytes) -> DetachedSignature: ...
 
-    def verify(self, message: bytes, signature: DetachedSignature) -> bool: ...
 
-
-def _signer_fingerprint(signer: ReceiptSigner) -> str:
+def _signer_fingerprint(signer: LeaseAuthorityVerifier) -> str:
     """Derive one representation-independent signer identity from raw key material."""
 
     try:
@@ -586,25 +598,46 @@ def _signer_fingerprint(signer: ReceiptSigner) -> str:
 
 
 def _verify_signer_signature(
-    signer: ReceiptSigner,
+    signer: LeaseAuthorityVerifier,
     message: bytes,
     signature: DetachedSignature,
     *,
     expected_fingerprint: str,
 ) -> bool:
-    """Verify with the exposed key as well as the signer adapter."""
+    """Verify locally with immutable key material; never call a remote adapter."""
 
     try:
         public_key = signer.public_key_bytes
-        if _digest(public_key) != expected_fingerprint:
+        key_id = signer.key_id
+        if (
+            type(message) is not bytes
+            or not isinstance(signature, DetachedSignature)
+            or type(key_id) is not str
+            or signature.key_id != key_id
+            or signature.algorithm != "ed25519"
+            or type(public_key) is not bytes
+            or len(public_key) != 32
+            or _digest(public_key) != expected_fingerprint
+        ):
+            return False
+        encoded = signature.signature.encode("ascii", errors="strict")
+        decoded = base64.b64decode(encoded, validate=True)
+        if len(decoded) != 64 or base64.b64encode(decoded) != encoded:
             return False
         Ed25519PublicKey.from_public_bytes(public_key).verify(
-            base64.b64decode(signature.signature, validate=True),
+            decoded,
             message,
         )
-    except (InvalidSignature, ValueError, TypeError, binascii.Error):
+    except (
+        AttributeError,
+        InvalidSignature,
+        UnicodeEncodeError,
+        ValueError,
+        TypeError,
+        binascii.Error,
+    ):
         return False
-    return signer.verify(message, signature)
+    return True
 
 
 class TrustPolicyResolver(Protocol):
@@ -655,9 +688,13 @@ class Clock(Protocol):
 
 
 class FaultPoint(StrEnum):
+    AFTER_PREPARE_BEFORE_RECEIPT_SIGN = "after-prepare-before-receipt-sign"
+    AFTER_RECEIPT_SIGN_BEFORE_FINALIZE = "after-receipt-sign-before-finalize"
     BEFORE_COMMIT = "before-commit"
     AFTER_COMMIT_BEFORE_CUSTODY = "after-commit-before-custody"
     AFTER_CUSTODY_BEFORE_ACK = "after-custody-before-ack"
+    AFTER_ACK_PREPARE_BEFORE_SIGN = "after-ack-prepare-before-sign"
+    AFTER_ACK_SIGN_BEFORE_FINALIZE = "after-ack-sign-before-finalize"
 
 
 class FaultInjector(Protocol):
@@ -897,6 +934,26 @@ class _StoredAdmission:
     custody_acknowledgement: CustodyAcknowledgement | None
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedAdmission:
+    """Durable unsigned receipt body and the exact bytes it will authorize."""
+
+    receipt_body_digest: str
+    body: AdmissionReceiptBody
+    envelope_bytes: bytes
+    cab_snapshot_bytes: bytes
+    trust_policy_bytes: bytes
+    attestation_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCustodyAcknowledgement:
+    """Durable unsigned acknowledgement body for one persisted custody object."""
+
+    acknowledgement_body_digest: str
+    body: CustodyAcknowledgementBody
+
+
 _SCHEMA_SCRIPT = """
 CREATE TABLE admission_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -989,6 +1046,36 @@ CREATE TABLE admissions (
     UNIQUE (tenant_id, receipt_sequence),
     UNIQUE (tenant_id, collector_id, epoch, sequence)
 ) STRICT;
+
+CREATE TABLE admission_preparations (
+    receipt_body_digest TEXT PRIMARY KEY,
+    lease_digest TEXT NOT NULL UNIQUE REFERENCES job_leases(lease_digest),
+    tenant_id TEXT NOT NULL UNIQUE,
+    collector_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch >= 1),
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    receipt_sequence INTEGER NOT NULL CHECK (receipt_sequence >= 1),
+    envelope_digest TEXT NOT NULL UNIQUE,
+    policy_id TEXT NOT NULL,
+    policy_revision INTEGER NOT NULL CHECK (policy_revision >= 1),
+    policy_digest TEXT NOT NULL,
+    receipt_body_bytes BLOB NOT NULL,
+    envelope_bytes BLOB NOT NULL,
+    cab_snapshot_bytes BLOB NOT NULL,
+    policy_bytes BLOB NOT NULL,
+    attestation_bytes BLOB NOT NULL,
+    custody_object_id TEXT NOT NULL UNIQUE,
+    custody_reference TEXT NOT NULL,
+    FOREIGN KEY (policy_id, policy_revision, policy_digest)
+        REFERENCES policy_versions (policy_id, policy_revision, policy_digest),
+    UNIQUE (tenant_id, collector_id, epoch, sequence)
+) STRICT;
+
+CREATE TABLE custody_ack_preparations (
+    receipt_digest TEXT PRIMARY KEY REFERENCES admissions(receipt_digest),
+    acknowledgement_body_digest TEXT NOT NULL UNIQUE,
+    acknowledgement_body_bytes BLOB NOT NULL
+) STRICT;
 """
 
 
@@ -1028,8 +1115,9 @@ class _SQLiteAdmissionLedger:
         self,
         path: Path,
         *,
-        lease_authority: ReceiptSigner,
+        lease_authority: LeaseAuthorityVerifier,
         receipt_signer: ReceiptSigner,
+        clock: Clock,
         limits: AdmissionLimits,
         fault_injector: FaultInjector,
     ) -> None:
@@ -1051,6 +1139,7 @@ class _SQLiteAdmissionLedger:
         if self._lease_authority_fingerprint == self._receipt_signer_fingerprint:
             raise RuntimeError("lease authority and receipt signer must use distinct key material")
         self._limits = limits
+        self._clock = clock
         self._fault_injector = fault_injector
         self._parent_fd = -1
         self._database_fd = -1
@@ -1318,7 +1407,7 @@ class _SQLiteAdmissionLedger:
                     ) VALUES (1, ?, ?, ?, ?, NULL)
                     """,
                     (
-                        ADMISSION_SCHEMA_VERSION,
+                        _LEDGER_SCHEMA_VERSION,
                         expected,
                         self._lease_authority_fingerprint,
                         self._receipt_signer_fingerprint,
@@ -1335,7 +1424,7 @@ class _SQLiteAdmissionLedger:
                 ).fetchone()
                 if (
                     meta is None
-                    or meta["schema_version"] != ADMISSION_SCHEMA_VERSION
+                    or meta["schema_version"] != _LEDGER_SCHEMA_VERSION
                     or meta["schema_fingerprint"] != expected
                     or meta["lease_authority_key_fingerprint"] != self._lease_authority_fingerprint
                     or meta["receipt_signer_key_fingerprint"] != self._receipt_signer_fingerprint
@@ -1680,6 +1769,222 @@ class _SQLiteAdmissionLedger:
             )
         return receipt
 
+    def _receipt_body(
+        self,
+        candidate: _VerifiedAdmission,
+        *,
+        receipt_sequence: int,
+        previous_receipt_digest: str | None,
+    ) -> AdmissionReceiptBody:
+        statement = candidate.statement
+        return AdmissionReceiptBody(
+            media_type=RECEIPT_MEDIA_TYPE,
+            schema_version=ADMISSION_SCHEMA_VERSION,
+            receipt_sequence=receipt_sequence,
+            admitted_at=candidate.admitted_at,
+            tenant_id=statement.tenant_id,
+            collector_id=statement.collector_id,
+            audience=statement.audience,
+            job_id=statement.job_id,
+            capability_digest=statement.capability_digest,
+            epoch=statement.epoch,
+            sequence=statement.sequence,
+            previous_epoch=statement.previous_epoch,
+            previous_epoch_final_sequence=statement.previous_epoch_final_sequence,
+            previous_epoch_final_receipt_digest=(statement.previous_epoch_final_receipt_digest),
+            lease_digest=statement.lease_digest,
+            nonce_digest=statement.nonce_digest(),
+            cab_id=statement.cab_id,
+            manifest_digest=statement.manifest_digest,
+            cab_snapshot_digest=candidate.snapshot.snapshot_digest,
+            cab_snapshot_media_type=SNAPSHOT_MEDIA_TYPE,
+            envelope_digest=candidate.envelope_digest,
+            payload_digest=_digest(statement.canonical_bytes()),
+            payload_type=COLLECTION_STATEMENT_MEDIA_TYPE,
+            trust_policy_digest=candidate.policy_digest,
+            trust_policy_id=statement.policy_id,
+            trust_policy_revision=statement.policy_revision,
+            trust_policy_schema_version=TRUST_POLICY_SCHEMA_VERSION,
+            lease_authority_key_fingerprint=self._lease_authority_fingerprint,
+            receipt_signer_key_fingerprint=self._receipt_signer_fingerprint,
+            attestation_verifier_id=ATTESTATION_VERIFIER_ID,
+            attestation_verification_digest=_digest(candidate.attestation_bytes),
+            accepted_key_ids=candidate.attestation.accepted_key_ids,
+            accepted_identities=candidate.attestation.accepted_identities,
+            admission_request_fingerprint=candidate.request_fingerprint,
+            previous_receipt_digest=previous_receipt_digest,
+            custody_object_id=candidate.custody_object_id,
+            custody_reference=candidate.custody_reference,
+        )
+
+    def _prepared_admission_from_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> _PreparedAdmission:
+        """Re-establish every unsigned preparation binding from durable bytes."""
+
+        try:
+            parsed = _parse_canonical_model(
+                bytes(row["receipt_body_bytes"]),
+                AdmissionReceiptBody,
+            )
+            assert isinstance(parsed, AdmissionReceiptBody)
+            body = parsed
+            envelope_bytes = bytes(row["envelope_bytes"])
+            snapshot_bytes = bytes(row["cab_snapshot_bytes"])
+            policy_bytes = bytes(row["policy_bytes"])
+            attestation_bytes = bytes(row["attestation_bytes"])
+            envelope = parse_dsse_envelope(envelope_bytes)
+            statement = parse_collection_statement(envelope.payload_bytes())
+            policy = parse_trust_policy(policy_bytes)
+            attestation = self._verify_attestation_bytes(attestation_bytes)
+            snapshot = verify_cab_snapshot(
+                snapshot_bytes,
+                maximum=self._limits.max_cab_snapshot_bytes,
+            )
+        except Exception as exc:
+            if isinstance(exc, AdmissionRejected):
+                raise
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "stored admission preparation is not canonical and verified",
+            ) from exc
+        body_bytes = body.canonical_bytes()
+        body_digest = _digest(body_bytes)
+        lease_row = connection.execute(
+            "SELECT * FROM job_leases WHERE lease_digest = ?",
+            (body.lease_digest,),
+        ).fetchone()
+        if lease_row is None:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "admission preparation references a missing lease",
+            )
+        grant = self._verify_grant_row(lease_row)
+        lease = grant.lease
+        consumed = lease_row["consumed_envelope_digest"]
+        consumed_receipt = lease_row["consumed_receipt_digest"]
+        policy_version = connection.execute(
+            """
+            SELECT policy_digest FROM policy_versions
+            WHERE policy_id = ? AND policy_revision = ?
+            """,
+            (body.trust_policy_id, body.trust_policy_revision),
+        ).fetchone()
+        reverified_attestation = verify_dsse_attestation(
+            envelope_bytes,
+            policy=policy,
+            expected_payload_type=COLLECTION_STATEMENT_MEDIA_TYPE,
+            expected_payload=statement.canonical_bytes(),
+            admission_time=_parse_timestamp(body.admitted_at),
+        )
+        fingerprint = _admission_request_fingerprint(
+            statement_digest=body.payload_digest,
+            envelope_digest=body.envelope_digest,
+            snapshot_digest=body.cab_snapshot_digest,
+            policy_digest=body.trust_policy_digest,
+            policy_revision=body.trust_policy_revision,
+            attestation_bytes=attestation_bytes,
+            audience=body.audience,
+            capability_digest=body.capability_digest,
+            accepted_key_ids=body.accepted_key_ids,
+            accepted_identities=body.accepted_identities,
+            custody_object_id=body.custody_object_id,
+            custody_reference=body.custody_reference,
+            lease_authority_key_fingerprint=body.lease_authority_key_fingerprint,
+            receipt_signer_key_fingerprint=body.receipt_signer_key_fingerprint,
+        )
+        expected_object_id = _custody_object_id(
+            tenant_id=statement.tenant_id,
+            job_id=statement.job_id,
+            envelope_digest=body.envelope_digest,
+            snapshot_digest=body.cab_snapshot_digest,
+        )
+        admitted_at = _parse_timestamp(body.admitted_at)
+        collected_at = _parse_timestamp(statement.collected_at)
+        scalar_pairs = (
+            (body_digest, row["receipt_body_digest"]),
+            (body.lease_digest, row["lease_digest"]),
+            (body.tenant_id, row["tenant_id"]),
+            (body.collector_id, row["collector_id"]),
+            (body.epoch, row["epoch"]),
+            (body.sequence, row["sequence"]),
+            (body.receipt_sequence, row["receipt_sequence"]),
+            (body.envelope_digest, row["envelope_digest"]),
+            (body.trust_policy_id, row["policy_id"]),
+            (body.trust_policy_revision, row["policy_revision"]),
+            (body.trust_policy_digest, row["policy_digest"]),
+            (body.custody_object_id, row["custody_object_id"]),
+            (body.custody_reference, row["custody_reference"]),
+            (_digest(envelope_bytes), body.envelope_digest),
+            (_digest(snapshot_bytes), body.cab_snapshot_digest),
+            (_digest(policy_bytes), body.trust_policy_digest),
+            (_digest(attestation_bytes), body.attestation_verification_digest),
+        )
+        if (
+            any(left != right for left, right in scalar_pairs)
+            or consumed is not None
+            or consumed_receipt is not None
+            or policy_version is None
+            or str(policy_version["policy_digest"]) != body.trust_policy_digest
+            or not statement.matches(lease)
+            or statement.canonical_bytes() != envelope.payload_bytes()
+            or body.lease_digest != lease.lease_digest()
+            or body.nonce_digest != statement.nonce_digest()
+            or body.tenant_id != statement.tenant_id
+            or body.collector_id != statement.collector_id
+            or body.audience != statement.audience
+            or body.job_id != statement.job_id
+            or body.capability_digest != statement.capability_digest
+            or body.epoch != statement.epoch
+            or body.sequence != statement.sequence
+            or body.previous_epoch != statement.previous_epoch
+            or body.previous_epoch_final_sequence != statement.previous_epoch_final_sequence
+            or body.previous_epoch_final_receipt_digest
+            != statement.previous_epoch_final_receipt_digest
+            or body.cab_id != statement.cab_id
+            or body.manifest_digest != statement.manifest_digest
+            or body.payload_digest != _digest(statement.canonical_bytes())
+            or body.trust_policy_id != statement.policy_id
+            or body.trust_policy_revision != statement.policy_revision
+            or body.trust_policy_digest != statement.policy_digest
+            or policy.policy_id != body.trust_policy_id
+            or snapshot.cab_id != body.cab_id
+            or snapshot.manifest_digest != body.manifest_digest
+            or body.custody_object_id != expected_object_id
+            or body.lease_authority_key_fingerprint != self._lease_authority_fingerprint
+            or body.lease_authority_key_fingerprint != lease.lease_authority_key_fingerprint
+            or body.receipt_signer_key_fingerprint != self._receipt_signer_fingerprint
+            or body.lease_authority_key_fingerprint == body.receipt_signer_key_fingerprint
+            or body.attestation_verifier_id != attestation.verifier_id
+            or body.accepted_key_ids != attestation.accepted_key_ids
+            or body.accepted_identities != attestation.accepted_identities
+            or f"sha256:{attestation.raw_envelope_sha256}" != body.envelope_digest
+            or f"sha256:{attestation.expected_payload_sha256}" != body.payload_digest
+            or f"sha256:{attestation.trust_policy_sha256}" != body.trust_policy_digest
+            or attestation.admission_time != body.admitted_at
+            or reverified_attestation.canonical_bytes() != attestation_bytes
+            or fingerprint != body.admission_request_fingerprint
+            or admitted_at < _parse_timestamp(lease.issued_at)
+            or admitted_at >= _parse_timestamp(lease.expires_at)
+            or collected_at < _parse_timestamp(lease.issued_at)
+            or collected_at >= _parse_timestamp(lease.expires_at)
+            or admitted_at < collected_at
+        ):
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "stored admission preparation bindings are incoherent",
+            )
+        return _PreparedAdmission(
+            receipt_body_digest=body_digest,
+            body=body,
+            envelope_bytes=envelope_bytes,
+            cab_snapshot_bytes=snapshot_bytes,
+            trust_policy_bytes=policy_bytes,
+            attestation_bytes=attestation_bytes,
+        )
+
     def _validate_complete_ledger(self, connection: sqlite3.Connection) -> None:
         """Verify every signed tenant/collector link after startup or outside writes.
 
@@ -1736,6 +2041,7 @@ class _SQLiteAdmissionLedger:
         }
         expected_collector_heads: dict[tuple[str, str], tuple[int, int, str]] = {}
         validated_tenant_heads: dict[str, tuple[int, str]] = {}
+        durable_admission_times: list[str] = []
 
         for summary in summaries:
             tenant_id = str(summary["tenant_id"])
@@ -1767,6 +2073,7 @@ class _SQLiteAdmissionLedger:
             for expected_sequence, row in enumerate(rows, start=1):
                 receipt = self._verify_receipt_row(connection, row)
                 body = receipt.body
+                durable_admission_times.append(body.admitted_at)
                 receipt_digest = receipt.receipt_digest()
                 if (
                     body.tenant_id != tenant_id
@@ -1846,6 +2153,77 @@ class _SQLiteAdmissionLedger:
                 "collector heads do not match complete signed collector histories",
             )
         self._validated_tenant_heads = validated_tenant_heads
+        prepared_times: list[str] = []
+        for row in connection.execute(
+            "SELECT * FROM admission_preparations ORDER BY tenant_id"
+        ).fetchall():
+            prepared = self._prepared_admission_from_row(connection, row)
+            body = prepared.body
+            tenant_head = self._verify_tenant_head(connection, body.tenant_id)
+            expected_sequence = 1 if tenant_head is None else tenant_head[0] + 1
+            expected_previous = None if tenant_head is None else tenant_head[1]
+            collector_head = self._verify_collector_head(
+                connection,
+                body.tenant_id,
+                body.collector_id,
+            )
+            if collector_head is None:
+                collector_valid = body.epoch == 1 and body.sequence == 1
+            elif body.epoch == collector_head[0]:
+                collector_valid = body.sequence == collector_head[1] + 1
+            elif body.epoch == collector_head[0] + 1:
+                collector_valid = (
+                    body.sequence == 1
+                    and (
+                        body.previous_epoch,
+                        body.previous_epoch_final_sequence,
+                        body.previous_epoch_final_receipt_digest,
+                    )
+                    == collector_head
+                )
+            else:
+                collector_valid = False
+            pending_predecessor = connection.execute(
+                """
+                SELECT 1 FROM admissions
+                WHERE tenant_id = ? AND custody_state = 'pending'
+                LIMIT 1
+                """,
+                (body.tenant_id,),
+            ).fetchone()
+            policy_head = self._verify_policy_head(
+                connection,
+                body.trust_policy_id,
+            )
+            if (
+                body.receipt_sequence != expected_sequence
+                or body.previous_receipt_digest != expected_previous
+                or not collector_valid
+                or pending_predecessor is not None
+                or policy_head is None
+                or body.trust_policy_revision > policy_head[0]
+            ):
+                raise AdmissionRejected(
+                    AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                    "admission preparation no longer reserves the next valid chain position",
+                )
+            prepared_times.append(body.admitted_at)
+        for row in connection.execute(
+            "SELECT * FROM custody_ack_preparations ORDER BY receipt_digest"
+        ).fetchall():
+            self._prepared_acknowledgement_from_row(connection, row)
+        meta = connection.execute(
+            "SELECT last_admitted_at FROM admission_meta WHERE singleton = 1"
+        ).fetchone()
+        expected_floor = max(
+            (*durable_admission_times, *prepared_times),
+            default=None,
+        )
+        if meta is None or meta["last_admitted_at"] != expected_floor:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "durable admission clock floor does not match receipts and reservations",
+            )
 
     def _verify_tenant_head(
         self,
@@ -1985,13 +2363,17 @@ class _SQLiteAdmissionLedger:
         ).fetchone()
         latest_admission = connection.execute(
             """
-            SELECT policy_revision, policy_digest
-            FROM admissions
-            WHERE policy_id = ?
+            SELECT policy_revision, policy_digest FROM (
+                SELECT policy_revision, policy_digest
+                FROM admissions WHERE policy_id = ?
+                UNION ALL
+                SELECT policy_revision, policy_digest
+                FROM admission_preparations WHERE policy_id = ?
+            )
             ORDER BY policy_revision DESC
             LIMIT 1
             """,
-            (policy_id,),
+            (policy_id, policy_id),
         ).fetchone()
         if head is None and latest is None and latest_admission is None:
             return None
@@ -2012,7 +2394,7 @@ class _SQLiteAdmissionLedger:
         if observed != expected or admitted != expected:
             raise AdmissionRejected(
                 AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
-                "trust-policy head does not match its immutable revision history",
+                "trust-policy head does not match admitted or reserved revision history",
             )
         return expected
 
@@ -2138,6 +2520,15 @@ class _SQLiteAdmissionLedger:
                 "service clock is earlier than the durable admission high-water mark",
             )
         return None if floor is None else str(floor)
+
+    def _trusted_current_time(self) -> str:
+        try:
+            return _canonical_timestamp(self._clock.now())
+        except (ValueError, TypeError) as exc:
+            raise AdmissionRejected(
+                AdmissionRejectReason.CLOCK_ROLLBACK,
+                "service clock did not return a valid trusted instant",
+            ) from exc
 
     def register_lease(self, grant_bytes: bytes) -> SignedJobLease:
         self._assert_configured_signer_material()
@@ -2279,11 +2670,9 @@ class _SQLiteAdmissionLedger:
         *,
         statement: CollectionStatement,
         envelope_digest: str,
-        current_time: str,
     ) -> str | None:
         try:
             with self._transaction() as connection:
-                self._clock_floor(connection, current_time)
                 lease_row, grant = self._lease_by_nonce(
                     connection,
                     statement.nonce_digest(),
@@ -2301,6 +2690,26 @@ class _SQLiteAdmissionLedger:
                         "stored lease consumption markers are incomplete",
                     )
                 if consumed is None:
+                    prepared_row = connection.execute(
+                        "SELECT * FROM admission_preparations WHERE lease_digest = ?",
+                        (grant.lease.lease_digest(),),
+                    ).fetchone()
+                    if prepared_row is not None:
+                        prepared = self._prepared_admission_from_row(
+                            connection,
+                            prepared_row,
+                        )
+                        if prepared.body.envelope_digest != envelope_digest:
+                            raise AdmissionRejected(
+                                AdmissionRejectReason.REPLAY_CONFLICT,
+                                "one-time lease is reserved by a different envelope",
+                            )
+                        self._clock_floor(
+                            connection,
+                            self._trusted_current_time(),
+                        )
+                        connection.rollback()
+                        return prepared.body.admitted_at
                     connection.rollback()
                     return None
                 if consumed != envelope_digest:
@@ -2308,6 +2717,7 @@ class _SQLiteAdmissionLedger:
                         AdmissionRejectReason.REPLAY_CONFLICT,
                         "one-time lease was consumed by a different envelope",
                     )
+                self._clock_floor(connection, self._trusted_current_time())
                 row = connection.execute(
                     "SELECT * FROM admissions WHERE lease_digest = ?",
                     (grant.lease.lease_digest(),),
@@ -2334,8 +2744,14 @@ class _SQLiteAdmissionLedger:
         incoming_bytes: int,
     ) -> None:
         tenant_count = connection.execute(
-            "SELECT count(*) FROM admissions WHERE tenant_id = ?",
-            (tenant_id,),
+            """
+            SELECT (
+                (SELECT count(*) FROM admissions WHERE tenant_id = ?)
+                +
+                (SELECT count(*) FROM admission_preparations WHERE tenant_id = ?)
+            )
+            """,
+            (tenant_id, tenant_id),
         ).fetchone()[0]
         if int(tenant_count) >= self._limits.max_admissions_per_tenant:
             raise AdmissionRejected(
@@ -2385,16 +2801,49 @@ class _SQLiteAdmissionLedger:
                 "admission database byte quota was exceeded by the transaction",
             )
 
-    def append(self, candidate: _VerifiedAdmission) -> _StoredAdmission:
-        """Private transaction boundary; all values came from ``AdmissionService``."""
+    def append(
+        self,
+        *,
+        statement: CollectionStatement,
+        envelope_digest: str,
+        original_admitted_at: str | None,
+        candidate_factory: Callable[[str], _VerifiedAdmission],
+    ) -> _StoredAdmission:
+        """Reserve, sign without a DB lock, then compare-and-finalize."""
 
         statement = CollectionStatement.model_validate(
-            candidate.statement.model_dump(mode="json"),
+            statement.model_dump(mode="json"),
             strict=True,
         )
+        prepared_or_stored = self._prepare_admission(
+            statement=statement,
+            envelope_digest=envelope_digest,
+            original_admitted_at=original_admitted_at,
+            candidate_factory=candidate_factory,
+        )
+        if isinstance(prepared_or_stored, _StoredAdmission):
+            return prepared_or_stored
+        return self._complete_prepared_admission(prepared_or_stored)
+
+    def _complete_prepared_admission(
+        self,
+        prepared: _PreparedAdmission,
+    ) -> _StoredAdmission:
+        self._fault_injector(FaultPoint.AFTER_PREPARE_BEFORE_RECEIPT_SIGN)
+        receipt = self._sign_prepared_admission(prepared)
+        self._fault_injector(FaultPoint.AFTER_RECEIPT_SIGN_BEFORE_FINALIZE)
+        return self._finalize_admission(prepared, receipt)
+
+    def _prepare_admission(
+        self,
+        *,
+        statement: CollectionStatement,
+        envelope_digest: str,
+        original_admitted_at: str | None,
+        candidate_factory: Callable[[str], _VerifiedAdmission],
+    ) -> _PreparedAdmission | _StoredAdmission:
         try:
             with self._transaction() as connection:
-                self._clock_floor(connection, candidate.current_time)
                 lease_row, grant = self._lease_by_nonce(
                     connection,
                     statement.nonce_digest(),
@@ -2413,7 +2862,7 @@ class _SQLiteAdmissionLedger:
                         "stored lease consumption markers are incomplete",
                     )
                 if consumed is not None:
-                    if consumed != candidate.envelope_digest:
+                    if consumed != envelope_digest:
                         raise AdmissionRejected(
                             AdmissionRejectReason.REPLAY_CONFLICT,
                             "one-time lease was consumed by a different envelope",
@@ -2429,12 +2878,30 @@ class _SQLiteAdmissionLedger:
                         )
                     receipt = self._verify_receipt_row(connection, row)
                     self._verify_receipt_chain_neighborhood(connection, row, receipt)
+                    if original_admitted_at is None:
+                        self._clock_floor(
+                            connection,
+                            self._trusted_current_time(),
+                        )
+                    elif original_admitted_at != receipt.body.admitted_at:
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                            "retry probe and durable receipt disagree on admission time",
+                        )
+                    candidate = candidate_factory(receipt.body.admitted_at)
+                    if (
+                        candidate.statement != statement
+                        or candidate.envelope_digest != envelope_digest
+                    ):
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                            "verified retry candidate changed its immutable request identity",
+                        )
                     if row["request_fingerprint"] != candidate.request_fingerprint:
                         raise AdmissionRejected(
                             AdmissionRejectReason.RETRY_MISMATCH,
                             "retry inputs differ from the original admission request",
                         )
-                    acknowledgement = self._stored_ack(row)
                     stored = _StoredAdmission(
                         disposition=AdmissionDisposition.EXACT_RETRY,
                         receipt=receipt,
@@ -2442,10 +2909,77 @@ class _SQLiteAdmissionLedger:
                         cab_snapshot_bytes=bytes(row["cab_snapshot_bytes"]),
                         trust_policy_bytes=bytes(row["policy_bytes"]),
                         custody_reference=str(row["custody_reference"]),
-                        custody_acknowledgement=acknowledgement,
+                        custody_acknowledgement=self._stored_ack(row),
                     )
                     connection.rollback()
                     return stored
+
+                prepared_row = connection.execute(
+                    "SELECT * FROM admission_preparations WHERE lease_digest = ?",
+                    (lease.lease_digest(),),
+                ).fetchone()
+                if prepared_row is not None:
+                    prepared = self._prepared_admission_from_row(
+                        connection,
+                        prepared_row,
+                    )
+                    if prepared.body.envelope_digest != envelope_digest:
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.REPLAY_CONFLICT,
+                            "one-time lease is reserved by a different envelope",
+                        )
+                    if original_admitted_at is None:
+                        self._clock_floor(
+                            connection,
+                            self._trusted_current_time(),
+                        )
+                    elif original_admitted_at != prepared.body.admitted_at:
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                            "retry probe and durable preparation disagree on admission time",
+                        )
+                    candidate = candidate_factory(prepared.body.admitted_at)
+                    expected_body = self._receipt_body(
+                        candidate,
+                        receipt_sequence=prepared.body.receipt_sequence,
+                        previous_receipt_digest=(prepared.body.previous_receipt_digest),
+                    )
+                    if (
+                        candidate.statement != statement
+                        or candidate.envelope_digest != envelope_digest
+                        or expected_body != prepared.body
+                        or candidate.envelope_bytes != prepared.envelope_bytes
+                        or candidate.snapshot.snapshot_bytes != prepared.cab_snapshot_bytes
+                        or candidate.policy_bytes != prepared.trust_policy_bytes
+                        or candidate.attestation_bytes != prepared.attestation_bytes
+                    ):
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.RETRY_MISMATCH,
+                            "retry inputs differ from the durable signing preparation",
+                        )
+                    connection.rollback()
+                    return prepared
+
+                tenant_preparation = connection.execute(
+                    """
+                    SELECT lease_digest FROM admission_preparations
+                    WHERE tenant_id = ?
+                    """,
+                    (statement.tenant_id,),
+                ).fetchone()
+                if tenant_preparation is not None:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.CUSTODY_UNAVAILABLE,
+                        "tenant has an earlier receipt awaiting signature; retry it first",
+                    )
+                current_time = self._trusted_current_time()
+                self._clock_floor(connection, current_time)
+                candidate = candidate_factory(current_time)
+                if candidate.statement != statement or candidate.envelope_digest != envelope_digest:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "verified admission candidate changed its immutable request identity",
+                    )
                 if candidate.admitted_at != candidate.current_time:
                     raise AdmissionRejected(
                         AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
@@ -2531,16 +3065,19 @@ class _SQLiteAdmissionLedger:
                         "tenant has an earlier receipt awaiting durable custody; "
                         "reconcile it before admitting a successor",
                     )
-                receipt_sequence = 1 if tenant_head is None else tenant_head[0] + 1
-                previous_digest = None if tenant_head is None else tenant_head[1]
                 duplicate_envelope = connection.execute(
-                    "SELECT 1 FROM admissions WHERE envelope_digest = ?",
-                    (candidate.envelope_digest,),
+                    """
+                    SELECT 1 FROM admissions WHERE envelope_digest = ?
+                    UNION ALL
+                    SELECT 1 FROM admission_preparations WHERE envelope_digest = ?
+                    LIMIT 1
+                    """,
+                    (candidate.envelope_digest, candidate.envelope_digest),
                 ).fetchone()
                 if duplicate_envelope is not None:
                     raise AdmissionRejected(
                         AdmissionRejectReason.REPLAY_CONFLICT,
-                        "envelope was already admitted under another lease",
+                        "envelope was already admitted or reserved under another lease",
                     )
                 self._advance_policy_head(
                     connection,
@@ -2548,11 +3085,28 @@ class _SQLiteAdmissionLedger:
                     policy_revision=statement.policy_revision,
                     policy_digest=candidate.policy_digest,
                 )
+                receipt_sequence = 1 if tenant_head is None else tenant_head[0] + 1
+                previous_digest = None if tenant_head is None else tenant_head[1]
+                body = self._receipt_body(
+                    candidate,
+                    receipt_sequence=receipt_sequence,
+                    previous_receipt_digest=previous_digest,
+                )
+                body_bytes = body.canonical_bytes()
+                prepared = _PreparedAdmission(
+                    receipt_body_digest=_digest(body_bytes),
+                    body=body,
+                    envelope_bytes=candidate.envelope_bytes,
+                    cab_snapshot_bytes=candidate.snapshot.snapshot_bytes,
+                    trust_policy_bytes=candidate.policy_bytes,
+                    attestation_bytes=candidate.attestation_bytes,
+                )
                 incoming_bytes = (
-                    len(candidate.envelope_bytes)
-                    + len(candidate.snapshot.snapshot_bytes)
-                    + len(candidate.policy_bytes)
-                    + len(candidate.attestation_bytes)
+                    len(body_bytes)
+                    + len(prepared.envelope_bytes)
+                    + len(prepared.cab_snapshot_bytes)
+                    + len(prepared.trust_policy_bytes)
+                    + len(prepared.attestation_bytes)
                     + 16 * 1024
                 )
                 self._check_quota(
@@ -2560,61 +3114,210 @@ class _SQLiteAdmissionLedger:
                     tenant_id=statement.tenant_id,
                     incoming_bytes=incoming_bytes,
                 )
-                body = AdmissionReceiptBody(
-                    media_type=RECEIPT_MEDIA_TYPE,
-                    schema_version=ADMISSION_SCHEMA_VERSION,
-                    receipt_sequence=receipt_sequence,
-                    admitted_at=candidate.admitted_at,
-                    tenant_id=statement.tenant_id,
-                    collector_id=statement.collector_id,
-                    audience=statement.audience,
-                    job_id=statement.job_id,
-                    capability_digest=statement.capability_digest,
-                    epoch=statement.epoch,
-                    sequence=statement.sequence,
-                    previous_epoch=statement.previous_epoch,
-                    previous_epoch_final_sequence=(statement.previous_epoch_final_sequence),
-                    previous_epoch_final_receipt_digest=(
-                        statement.previous_epoch_final_receipt_digest
+                connection.execute(
+                    """
+                    INSERT INTO admission_preparations (
+                        receipt_body_digest, lease_digest, tenant_id,
+                        collector_id, epoch, sequence, receipt_sequence,
+                        envelope_digest, policy_id, policy_revision,
+                        policy_digest, receipt_body_bytes, envelope_bytes,
+                        cab_snapshot_bytes, policy_bytes, attestation_bytes,
+                        custody_object_id, custody_reference
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        prepared.receipt_body_digest,
+                        body.lease_digest,
+                        body.tenant_id,
+                        body.collector_id,
+                        body.epoch,
+                        body.sequence,
+                        body.receipt_sequence,
+                        body.envelope_digest,
+                        body.trust_policy_id,
+                        body.trust_policy_revision,
+                        body.trust_policy_digest,
+                        body_bytes,
+                        prepared.envelope_bytes,
+                        prepared.cab_snapshot_bytes,
+                        prepared.trust_policy_bytes,
+                        prepared.attestation_bytes,
+                        body.custody_object_id,
+                        body.custody_reference,
                     ),
-                    lease_digest=statement.lease_digest,
-                    nonce_digest=statement.nonce_digest(),
-                    cab_id=statement.cab_id,
-                    manifest_digest=statement.manifest_digest,
-                    cab_snapshot_digest=candidate.snapshot.snapshot_digest,
-                    cab_snapshot_media_type=SNAPSHOT_MEDIA_TYPE,
-                    envelope_digest=candidate.envelope_digest,
-                    payload_digest=_digest(statement.canonical_bytes()),
-                    payload_type=COLLECTION_STATEMENT_MEDIA_TYPE,
-                    trust_policy_digest=candidate.policy_digest,
-                    trust_policy_id=statement.policy_id,
-                    trust_policy_revision=statement.policy_revision,
-                    trust_policy_schema_version=TRUST_POLICY_SCHEMA_VERSION,
-                    lease_authority_key_fingerprint=(self._lease_authority_fingerprint),
-                    receipt_signer_key_fingerprint=self._receipt_signer_fingerprint,
-                    attestation_verifier_id=ATTESTATION_VERIFIER_ID,
-                    attestation_verification_digest=_digest(candidate.attestation_bytes),
-                    accepted_key_ids=candidate.attestation.accepted_key_ids,
-                    accepted_identities=candidate.attestation.accepted_identities,
-                    admission_request_fingerprint=candidate.request_fingerprint,
-                    previous_receipt_digest=previous_digest,
-                    custody_object_id=candidate.custody_object_id,
-                    custody_reference=candidate.custody_reference,
                 )
-                self._assert_configured_signer_material()
-                signature = self._receipt_signer.sign(body.canonical_bytes())
+                connection.execute(
+                    """
+                    UPDATE admission_meta SET last_admitted_at = ?
+                    WHERE singleton = 1
+                    """,
+                    (candidate.current_time,),
+                )
+                self._check_database_quota_after_write(connection)
+                connection.commit()
+                return prepared
+        except AdmissionRejected:
+            raise
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            raise self._storage_rejected(exc) from exc
+
+    def _sign_prepared_admission(
+        self,
+        prepared: _PreparedAdmission,
+    ) -> AdmissionReceipt:
+        body_bytes = prepared.body.canonical_bytes()
+        if _digest(body_bytes) != prepared.receipt_body_digest:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "in-memory receipt preparation changed before signing",
+            )
+        self._assert_configured_signer_material()
+        try:
+            signature = self._receipt_signer.sign(body_bytes)
+        except Exception as exc:
+            raise AdmissionRejected(
+                AdmissionRejectReason.SIGNER_UNAVAILABLE,
+                "receipt signer is unavailable; retry the exact request",
+            ) from exc
+        self._assert_configured_signer_material()
+        if not _verify_signer_signature(
+            self._receipt_signer,
+            body_bytes,
+            signature,
+            expected_fingerprint=self._receipt_signer_fingerprint,
+        ):
+            raise AdmissionRejected(
+                AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE,
+                "receipt signer returned an invalid or substituted signature",
+            )
+        return AdmissionReceipt(
+            body=prepared.body,
+            service_signature=signature,
+        )
+
+    def _finalize_admission(
+        self,
+        expected: _PreparedAdmission,
+        receipt: AdmissionReceipt,
+    ) -> _StoredAdmission:
+        try:
+            with self._transaction() as connection:
+                existing_row = connection.execute(
+                    "SELECT * FROM admissions WHERE lease_digest = ?",
+                    (expected.body.lease_digest,),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = self._verify_receipt_row(connection, existing_row)
+                    self._verify_receipt_chain_neighborhood(
+                        connection,
+                        existing_row,
+                        existing,
+                    )
+                    if existing.body != expected.body or receipt.body != expected.body:
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.RETRY_MISMATCH,
+                            "finalized receipt differs from the durable preparation",
+                        )
+                    stored = _StoredAdmission(
+                        disposition=AdmissionDisposition.EXACT_RETRY,
+                        receipt=existing,
+                        envelope_bytes=bytes(existing_row["envelope_bytes"]),
+                        cab_snapshot_bytes=bytes(existing_row["cab_snapshot_bytes"]),
+                        trust_policy_bytes=bytes(existing_row["policy_bytes"]),
+                        custody_reference=str(existing_row["custody_reference"]),
+                        custody_acknowledgement=self._stored_ack(existing_row),
+                    )
+                    connection.rollback()
+                    return stored
+                row = connection.execute(
+                    "SELECT * FROM admission_preparations WHERE lease_digest = ?",
+                    (expected.body.lease_digest,),
+                ).fetchone()
+                if row is None:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "durable receipt preparation disappeared before finalization",
+                    )
+                prepared = self._prepared_admission_from_row(connection, row)
+                if prepared != expected or receipt.body != prepared.body:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.RETRY_MISMATCH,
+                        "signed receipt does not match the durable preparation",
+                    )
                 if not _verify_signer_signature(
                     self._receipt_signer,
-                    body.canonical_bytes(),
-                    signature,
+                    receipt.body.canonical_bytes(),
+                    receipt.service_signature,
                     expected_fingerprint=self._receipt_signer_fingerprint,
                 ):
                     raise AdmissionRejected(
                         AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE,
-                        "receipt signer returned an invalid signature",
+                        "signed receipt changed before finalization",
                     )
-                receipt = AdmissionReceipt(body=body, service_signature=signature)
+                tenant_head = self._verify_tenant_head(
+                    connection,
+                    prepared.body.tenant_id,
+                )
+                expected_sequence = 1 if tenant_head is None else tenant_head[0] + 1
+                expected_previous = None if tenant_head is None else tenant_head[1]
+                collector_head = self._verify_collector_head(
+                    connection,
+                    prepared.body.tenant_id,
+                    prepared.body.collector_id,
+                )
+                if collector_head is None:
+                    collector_valid = prepared.body.epoch == 1 and prepared.body.sequence == 1
+                elif prepared.body.epoch == collector_head[0]:
+                    collector_valid = prepared.body.sequence == collector_head[1] + 1
+                elif prepared.body.epoch == collector_head[0] + 1:
+                    collector_valid = (
+                        prepared.body.sequence == 1
+                        and (
+                            prepared.body.previous_epoch,
+                            prepared.body.previous_epoch_final_sequence,
+                            prepared.body.previous_epoch_final_receipt_digest,
+                        )
+                        == collector_head
+                    )
+                else:
+                    collector_valid = False
+                pending_predecessor = connection.execute(
+                    """
+                    SELECT 1 FROM admissions
+                    WHERE tenant_id = ? AND custody_state = 'pending'
+                    LIMIT 1
+                    """,
+                    (prepared.body.tenant_id,),
+                ).fetchone()
+                if (
+                    prepared.body.receipt_sequence != expected_sequence
+                    or prepared.body.previous_receipt_digest != expected_previous
+                    or not collector_valid
+                    or pending_predecessor is not None
+                ):
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "reserved tenant or collector chain position changed",
+                    )
                 receipt_digest = receipt.receipt_digest()
+                # This replaces a bounded preparation. The rollbackable
+                # post-write check below measures logical pages without
+                # double-counting the preparation's already-committed WAL.
+                deleted = connection.execute(
+                    """
+                    DELETE FROM admission_preparations
+                    WHERE receipt_body_digest = ? AND lease_digest = ?
+                    """,
+                    (
+                        prepared.receipt_body_digest,
+                        prepared.body.lease_digest,
+                    ),
+                )
+                if deleted.rowcount != 1:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "receipt preparation compare-and-delete failed",
+                    )
                 connection.execute(
                     """
                     INSERT INTO admissions (
@@ -2633,39 +3336,41 @@ class _SQLiteAdmissionLedger:
                     """,
                     (
                         receipt_digest,
-                        receipt_sequence,
-                        lease.lease_digest(),
-                        statement.tenant_id,
-                        statement.collector_id,
-                        statement.epoch,
-                        statement.sequence,
-                        candidate.envelope_digest,
-                        _digest(statement.canonical_bytes()),
-                        candidate.snapshot.snapshot_digest,
-                        statement.policy_id,
-                        statement.policy_revision,
-                        candidate.policy_digest,
-                        _digest(candidate.attestation_bytes),
-                        candidate.request_fingerprint,
+                        prepared.body.receipt_sequence,
+                        prepared.body.lease_digest,
+                        prepared.body.tenant_id,
+                        prepared.body.collector_id,
+                        prepared.body.epoch,
+                        prepared.body.sequence,
+                        prepared.body.envelope_digest,
+                        prepared.body.payload_digest,
+                        prepared.body.cab_snapshot_digest,
+                        prepared.body.trust_policy_id,
+                        prepared.body.trust_policy_revision,
+                        prepared.body.trust_policy_digest,
+                        prepared.body.attestation_verification_digest,
+                        prepared.body.admission_request_fingerprint,
                         receipt.canonical_bytes(),
-                        candidate.envelope_bytes,
-                        candidate.snapshot.snapshot_bytes,
-                        candidate.policy_bytes,
-                        candidate.attestation_bytes,
-                        candidate.custody_object_id,
-                        candidate.custody_reference,
+                        prepared.envelope_bytes,
+                        prepared.cab_snapshot_bytes,
+                        prepared.trust_policy_bytes,
+                        prepared.attestation_bytes,
+                        prepared.body.custody_object_id,
+                        prepared.body.custody_reference,
                     ),
                 )
                 updated = connection.execute(
                     """
                     UPDATE job_leases
                     SET consumed_envelope_digest = ?, consumed_receipt_digest = ?
-                    WHERE lease_digest = ? AND consumed_envelope_digest IS NULL
+                    WHERE lease_digest = ?
+                      AND consumed_envelope_digest IS NULL
+                      AND consumed_receipt_digest IS NULL
                     """,
                     (
-                        candidate.envelope_digest,
+                        prepared.body.envelope_digest,
                         receipt_digest,
-                        lease.lease_digest(),
+                        prepared.body.lease_digest,
                     ),
                 )
                 if updated.rowcount != 1:
@@ -2685,10 +3390,10 @@ class _SQLiteAdmissionLedger:
                         last_receipt_digest = excluded.last_receipt_digest
                     """,
                     (
-                        statement.tenant_id,
-                        statement.collector_id,
-                        statement.epoch,
-                        statement.sequence,
+                        prepared.body.tenant_id,
+                        prepared.body.collector_id,
+                        prepared.body.epoch,
+                        prepared.body.sequence,
                         receipt_digest,
                     ),
                 )
@@ -2701,29 +3406,26 @@ class _SQLiteAdmissionLedger:
                         last_receipt_sequence = excluded.last_receipt_sequence,
                         last_receipt_digest = excluded.last_receipt_digest
                     """,
-                    (statement.tenant_id, receipt_sequence, receipt_digest),
-                )
-                connection.execute(
-                    """
-                    UPDATE admission_meta SET last_admitted_at = ?
-                    WHERE singleton = 1
-                    """,
-                    (candidate.current_time,),
+                    (
+                        prepared.body.tenant_id,
+                        prepared.body.receipt_sequence,
+                        receipt_digest,
+                    ),
                 )
                 self._check_database_quota_after_write(connection)
                 self._fault_injector(FaultPoint.BEFORE_COMMIT)
                 connection.commit()
-                self._validated_tenant_heads[statement.tenant_id] = (
-                    receipt_sequence,
+                self._validated_tenant_heads[prepared.body.tenant_id] = (
+                    prepared.body.receipt_sequence,
                     receipt_digest,
                 )
                 return _StoredAdmission(
                     disposition=AdmissionDisposition.ADMITTED,
                     receipt=receipt,
-                    envelope_bytes=candidate.envelope_bytes,
-                    cab_snapshot_bytes=candidate.snapshot.snapshot_bytes,
-                    trust_policy_bytes=candidate.policy_bytes,
-                    custody_reference=candidate.custody_reference,
+                    envelope_bytes=prepared.envelope_bytes,
+                    cab_snapshot_bytes=prepared.cab_snapshot_bytes,
+                    trust_policy_bytes=prepared.trust_policy_bytes,
+                    custody_reference=prepared.body.custody_reference,
                     custody_acknowledgement=None,
                 )
         except AdmissionRejected:
@@ -2777,12 +3479,100 @@ class _SQLiteAdmissionLedger:
             )
         return acknowledgement
 
+    def _prepared_acknowledgement_from_row(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> _PreparedCustodyAcknowledgement:
+        try:
+            parsed = _parse_canonical_model(
+                bytes(row["acknowledgement_body_bytes"]),
+                CustodyAcknowledgementBody,
+            )
+            assert isinstance(parsed, CustodyAcknowledgementBody)
+            body = parsed
+        except Exception as exc:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "stored custody acknowledgement preparation is not canonical",
+            ) from exc
+        body_digest = _digest(body.canonical_bytes())
+        admission_row = connection.execute(
+            "SELECT * FROM admissions WHERE receipt_digest = ?",
+            (body.receipt_digest,),
+        ).fetchone()
+        if admission_row is None:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "custody acknowledgement preparation references a missing receipt",
+            )
+        receipt = self._verify_receipt_row(connection, admission_row)
+        if (
+            body.receipt_digest != row["receipt_digest"]
+            or body_digest != row["acknowledgement_body_digest"]
+            or admission_row["custody_state"] != "pending"
+            or admission_row["custody_ack_digest"] is not None
+            or admission_row["custody_ack_bytes"] is not None
+            or body.receipt_digest != receipt.receipt_digest()
+            or body.custody_object_id != receipt.body.custody_object_id
+            or body.custody_reference != receipt.body.custody_reference
+            or body.envelope_digest != receipt.body.envelope_digest
+            or body.cab_snapshot_digest != receipt.body.cab_snapshot_digest
+            or body.trust_policy_digest != receipt.body.trust_policy_digest
+            or body.receipt_signer_key_fingerprint != self._receipt_signer_fingerprint
+        ):
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "stored custody acknowledgement preparation bindings are incoherent",
+            )
+        pending_predecessor = connection.execute(
+            """
+            SELECT 1 FROM admissions
+            WHERE tenant_id = ? AND receipt_sequence < ?
+              AND custody_state != 'durable'
+            ORDER BY receipt_sequence LIMIT 1
+            """,
+            (
+                admission_row["tenant_id"],
+                admission_row["receipt_sequence"],
+            ),
+        ).fetchone()
+        if pending_predecessor is not None:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "custody acknowledgement preparation bypasses a pending predecessor",
+            )
+        return _PreparedCustodyAcknowledgement(
+            acknowledgement_body_digest=body_digest,
+            body=body,
+        )
+
     def mark_custody_durable(
         self,
         *,
         receipt_digest: str,
         custody_reference: str,
     ) -> CustodyAcknowledgement:
+        prepared_or_existing = self._prepare_custody_acknowledgement(
+            receipt_digest=receipt_digest,
+            custody_reference=custody_reference,
+        )
+        if isinstance(prepared_or_existing, CustodyAcknowledgement):
+            return prepared_or_existing
+        self._fault_injector(FaultPoint.AFTER_ACK_PREPARE_BEFORE_SIGN)
+        acknowledgement = self._sign_prepared_acknowledgement(prepared_or_existing)
+        self._fault_injector(FaultPoint.AFTER_ACK_SIGN_BEFORE_FINALIZE)
+        return self._finalize_custody_acknowledgement(
+            prepared_or_existing,
+            acknowledgement,
+        )
+
+    def _prepare_custody_acknowledgement(
+        self,
+        *,
+        receipt_digest: str,
+        custody_reference: str,
+    ) -> _PreparedCustodyAcknowledgement | CustodyAcknowledgement:
         try:
             with self._transaction() as connection:
                 row = connection.execute(
@@ -2804,6 +3594,25 @@ class _SQLiteAdmissionLedger:
                 if existing is not None:
                     connection.rollback()
                     return existing
+                prepared_row = connection.execute(
+                    """
+                    SELECT * FROM custody_ack_preparations
+                    WHERE receipt_digest = ?
+                    """,
+                    (receipt_digest,),
+                ).fetchone()
+                if prepared_row is not None:
+                    prepared = self._prepared_acknowledgement_from_row(
+                        connection,
+                        prepared_row,
+                    )
+                    if prepared.body.custody_reference != custody_reference:
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.CUSTODY_UNAVAILABLE,
+                            "custody acknowledgement retry changed its reference",
+                        )
+                    connection.rollback()
+                    return prepared
                 pending_predecessor = connection.execute(
                     """
                     SELECT receipt_sequence FROM admissions
@@ -2829,26 +3638,158 @@ class _SQLiteAdmissionLedger:
                     trust_policy_digest=receipt.body.trust_policy_digest,
                     receipt_signer_key_fingerprint=self._receipt_signer_fingerprint,
                 )
-                self._assert_configured_signer_material()
-                signature = self._receipt_signer.sign(body.canonical_bytes())
-                if not _verify_signer_signature(
-                    self._receipt_signer,
-                    body.canonical_bytes(),
-                    signature,
-                    expected_fingerprint=self._receipt_signer_fingerprint,
+                prepared = _PreparedCustodyAcknowledgement(
+                    acknowledgement_body_digest=_digest(body.canonical_bytes()),
+                    body=body,
+                )
+                # The body is schema-bounded. Let the rollbackable post-write
+                # quota check decide rather than pessimistically counting the
+                # receipt transaction's committed WAL a second time.
+                connection.execute(
+                    """
+                    INSERT INTO custody_ack_preparations (
+                        receipt_digest, acknowledgement_body_digest,
+                        acknowledgement_body_bytes
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        receipt_digest,
+                        prepared.acknowledgement_body_digest,
+                        body.canonical_bytes(),
+                    ),
+                )
+                self._check_database_quota_after_write(connection)
+                connection.commit()
+                return prepared
+        except AdmissionRejected:
+            raise
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            raise self._storage_rejected(exc) from exc
+
+    def _sign_prepared_acknowledgement(
+        self,
+        prepared: _PreparedCustodyAcknowledgement,
+    ) -> CustodyAcknowledgement:
+        body_bytes = prepared.body.canonical_bytes()
+        if _digest(body_bytes) != prepared.acknowledgement_body_digest:
+            raise AdmissionRejected(
+                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                "in-memory custody acknowledgement preparation changed",
+            )
+        self._assert_configured_signer_material()
+        try:
+            signature = self._receipt_signer.sign(body_bytes)
+        except Exception as exc:
+            raise AdmissionRejected(
+                AdmissionRejectReason.SIGNER_UNAVAILABLE,
+                "custody acknowledgement signer is unavailable; retry reconciliation",
+            ) from exc
+        self._assert_configured_signer_material()
+        if not _verify_signer_signature(
+            self._receipt_signer,
+            body_bytes,
+            signature,
+            expected_fingerprint=self._receipt_signer_fingerprint,
+        ):
+            raise AdmissionRejected(
+                AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE,
+                "custody acknowledgement signer returned a substituted signature",
+            )
+        return CustodyAcknowledgement(
+            body=prepared.body,
+            service_signature=signature,
+        )
+
+    def _finalize_custody_acknowledgement(
+        self,
+        expected: _PreparedCustodyAcknowledgement,
+        acknowledgement: CustodyAcknowledgement,
+    ) -> CustodyAcknowledgement:
+        try:
+            with self._transaction() as connection:
+                admission_row = connection.execute(
+                    "SELECT * FROM admissions WHERE receipt_digest = ?",
+                    (expected.body.receipt_digest,),
+                ).fetchone()
+                if admission_row is None:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "receipt disappeared before custody acknowledgement finalization",
+                    )
+                existing = self._stored_ack(admission_row)
+                if existing is not None:
+                    if existing.body != expected.body or acknowledgement.body != expected.body:
+                        raise AdmissionRejected(
+                            AdmissionRejectReason.RETRY_MISMATCH,
+                            "final custody acknowledgement differs from its preparation",
+                        )
+                    connection.rollback()
+                    return existing
+                prepared_row = connection.execute(
+                    """
+                    SELECT * FROM custody_ack_preparations
+                    WHERE receipt_digest = ?
+                    """,
+                    (expected.body.receipt_digest,),
+                ).fetchone()
+                if prepared_row is None:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "custody acknowledgement preparation disappeared",
+                    )
+                prepared = self._prepared_acknowledgement_from_row(
+                    connection,
+                    prepared_row,
+                )
+                if (
+                    prepared != expected
+                    or acknowledgement.body != prepared.body
+                    or not _verify_signer_signature(
+                        self._receipt_signer,
+                        acknowledgement.body.canonical_bytes(),
+                        acknowledgement.service_signature,
+                        expected_fingerprint=self._receipt_signer_fingerprint,
+                    )
                 ):
                     raise AdmissionRejected(
                         AdmissionRejectReason.INVALID_RECEIPT_SIGNATURE,
-                        "custody acknowledgement signer returned an invalid signature",
+                        "custody acknowledgement changed before finalization",
                     )
-                acknowledgement = CustodyAcknowledgement(
-                    body=body,
-                    service_signature=signature,
+                pending_predecessor = connection.execute(
+                    """
+                    SELECT 1 FROM admissions
+                    WHERE tenant_id = ? AND receipt_sequence < ?
+                      AND custody_state != 'durable'
+                    ORDER BY receipt_sequence LIMIT 1
+                    """,
+                    (
+                        admission_row["tenant_id"],
+                        admission_row["receipt_sequence"],
+                    ),
+                ).fetchone()
+                if pending_predecessor is not None:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.CUSTODY_UNAVAILABLE,
+                        "an earlier tenant receipt must reach durable custody first",
+                    )
+                # Like receipt finalization, this replaces a bounded
+                # preparation and is guarded by the post-write logical quota.
+                deleted = connection.execute(
+                    """
+                    DELETE FROM custody_ack_preparations
+                    WHERE receipt_digest = ?
+                      AND acknowledgement_body_digest = ?
+                    """,
+                    (
+                        expected.body.receipt_digest,
+                        expected.acknowledgement_body_digest,
+                    ),
                 )
-                self._check_database_capacity(
-                    connection,
-                    incoming_bytes=len(acknowledgement.canonical_bytes()) + 1024,
-                )
+                if deleted.rowcount != 1:
+                    raise AdmissionRejected(
+                        AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                        "custody acknowledgement compare-and-delete failed",
+                    )
                 updated = connection.execute(
                     """
                     UPDATE admissions
@@ -2860,7 +3801,7 @@ class _SQLiteAdmissionLedger:
                     (
                         acknowledgement.acknowledgement_digest(),
                         acknowledgement.canonical_bytes(),
-                        receipt_digest,
+                        expected.body.receipt_digest,
                     ),
                 )
                 if updated.rowcount != 1:
@@ -2875,6 +3816,55 @@ class _SQLiteAdmissionLedger:
             raise
         except (sqlite3.Error, OSError, RuntimeError) as exc:
             raise self._storage_rejected(exc) from exc
+
+    def reconcile_prepared(
+        self,
+        *,
+        limit: int = 100,
+    ) -> Iterator[_StoredAdmission]:
+        """Sign and finalize durable preparations without reopening source inputs."""
+
+        if type(limit) is not int or limit < 1 or limit > 1000:
+            raise ValueError("prepared reconciliation limit must be between 1 and 1000")
+        try:
+            with self._transaction() as connection:
+                body_digests = tuple(
+                    str(row["receipt_body_digest"])
+                    for row in connection.execute(
+                        """
+                        SELECT receipt_body_digest
+                        FROM admission_preparations
+                        ORDER BY receipt_body_digest
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
+                )
+                connection.rollback()
+        except AdmissionRejected:
+            raise
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            raise self._storage_rejected(exc) from exc
+        for body_digest in body_digests:
+            try:
+                with self._transaction() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT * FROM admission_preparations
+                        WHERE receipt_body_digest = ?
+                        """,
+                        (body_digest,),
+                    ).fetchone()
+                    if row is None:
+                        connection.rollback()
+                        continue
+                    prepared = self._prepared_admission_from_row(connection, row)
+                    connection.rollback()
+            except AdmissionRejected:
+                raise
+            except (sqlite3.Error, OSError, RuntimeError) as exc:
+                raise self._storage_rejected(exc) from exc
+            yield self._complete_prepared_admission(prepared)
 
     def pending(self, *, limit: int = 100) -> tuple[_StoredAdmission, ...]:
         if type(limit) is not int or limit < 1 or limit > 1000:
@@ -2918,7 +3908,7 @@ class AdmissionService:
         self,
         path: Path,
         *,
-        lease_authority: ReceiptSigner,
+        lease_authority: LeaseAuthorityVerifier,
         receipt_signer: ReceiptSigner,
         policy_resolver: TrustPolicyResolver,
         custody: CustodyStore,
@@ -2941,6 +3931,7 @@ class AdmissionService:
             path,
             lease_authority=lease_authority,
             receipt_signer=receipt_signer,
+            clock=self._clock,
             limits=self._limits,
             fault_injector=self._fault_injector,
         )
@@ -3010,13 +4001,6 @@ class AdmissionService:
     ) -> AdmissionOutcome:
         """Verify raw envelope, authoritative policy, and exact CAB, then admit."""
 
-        try:
-            current_time = _canonical_timestamp(self._clock.now())
-        except (ValueError, TypeError) as exc:
-            raise AdmissionRejected(
-                AdmissionRejectReason.CLOCK_ROLLBACK,
-                "service clock did not return a valid trusted instant",
-            ) from exc
         if type(envelope_bytes) is not bytes:
             raise AdmissionRejected(
                 AdmissionRejectReason.MALFORMED_ENVELOPE,
@@ -3048,7 +4032,6 @@ class AdmissionService:
         original_time = self._ledger.retry_admitted_at(
             statement=statement,
             envelope_digest=envelope_digest,
-            current_time=current_time,
         )
         policy_bytes, policy = self._resolve_policy(
             policy_id=statement.policy_id,
@@ -3056,38 +4039,7 @@ class AdmissionService:
             policy_digest=statement.policy_digest,
             exact_retry=original_time is not None,
         )
-        verification_time = (
-            _parse_timestamp(original_time)
-            if original_time is not None
-            else _parse_timestamp(current_time)
-        )
-        verification = verify_dsse_attestation(
-            envelope_bytes,
-            policy=policy,
-            expected_payload_type=COLLECTION_STATEMENT_MEDIA_TYPE,
-            expected_payload=statement.canonical_bytes(),
-            admission_time=verification_time,
-        )
-        if not verification.verified or verification.reason_code != AttestationReason.VERIFIED:
-            raise AdmissionRejected(
-                AdmissionRejectReason.ATTESTATION_REJECTED,
-                f"DSSE attestation rejected: {verification.reason_code}",
-            )
         policy_digest = _digest(policy_bytes)
-        if (
-            policy_digest != statement.policy_digest
-            or verification.raw_envelope_sha256 != envelope_digest.removeprefix("sha256:")
-            or verification.expected_payload_sha256
-            != _digest(statement.canonical_bytes()).removeprefix("sha256:")
-            or verification.expected_payload_type != COLLECTION_STATEMENT_MEDIA_TYPE
-            or verification.trust_policy_sha256 != policy_digest.removeprefix("sha256:")
-            or verification.policy_id != statement.policy_id
-            or verification.admission_time != _canonical_timestamp(verification_time)
-        ):
-            raise AdmissionRejected(
-                AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
-                "attestation verifier returned incoherent provenance",
-            )
         try:
             snapshot = capture_cab_snapshot(
                 cab_source,
@@ -3119,39 +4071,74 @@ class AdmissionService:
                 AdmissionRejectReason.CUSTODY_UNAVAILABLE,
                 "custody could not derive a deterministic object reference",
             ) from exc
-        attestation_bytes = _attestation_bytes(verification)
-        request_fingerprint = _admission_request_fingerprint(
-            statement_digest=_digest(statement.canonical_bytes()),
-            envelope_digest=envelope_digest,
-            snapshot_digest=snapshot.snapshot_digest,
-            policy_digest=policy_digest,
-            policy_revision=statement.policy_revision,
-            attestation_bytes=attestation_bytes,
-            audience=statement.audience,
-            capability_digest=statement.capability_digest,
-            accepted_key_ids=verification.accepted_key_ids,
-            accepted_identities=verification.accepted_identities,
-            custody_object_id=object_id,
-            custody_reference=expected_reference,
-            lease_authority_key_fingerprint=(self._ledger.lease_authority_fingerprint),
-            receipt_signer_key_fingerprint=self._ledger.receipt_signer_fingerprint,
-        )
-        candidate = _VerifiedAdmission(
+
+        def candidate_for(admission_time: str) -> _VerifiedAdmission:
+            verification_time = _parse_timestamp(admission_time)
+            verification = verify_dsse_attestation(
+                envelope_bytes,
+                policy=policy,
+                expected_payload_type=COLLECTION_STATEMENT_MEDIA_TYPE,
+                expected_payload=statement.canonical_bytes(),
+                admission_time=verification_time,
+            )
+            if not verification.verified or verification.reason_code != AttestationReason.VERIFIED:
+                raise AdmissionRejected(
+                    AdmissionRejectReason.ATTESTATION_REJECTED,
+                    f"DSSE attestation rejected: {verification.reason_code}",
+                )
+            if (
+                policy_digest != statement.policy_digest
+                or verification.raw_envelope_sha256 != envelope_digest.removeprefix("sha256:")
+                or verification.expected_payload_sha256
+                != _digest(statement.canonical_bytes()).removeprefix("sha256:")
+                or verification.expected_payload_type != COLLECTION_STATEMENT_MEDIA_TYPE
+                or verification.trust_policy_sha256 != policy_digest.removeprefix("sha256:")
+                or verification.policy_id != statement.policy_id
+                or verification.admission_time != admission_time
+            ):
+                raise AdmissionRejected(
+                    AdmissionRejectReason.INTERNAL_INTEGRITY_ERROR,
+                    "attestation verifier returned incoherent provenance",
+                )
+            attestation_bytes = _attestation_bytes(verification)
+            request_fingerprint = _admission_request_fingerprint(
+                statement_digest=_digest(statement.canonical_bytes()),
+                envelope_digest=envelope_digest,
+                snapshot_digest=snapshot.snapshot_digest,
+                policy_digest=policy_digest,
+                policy_revision=statement.policy_revision,
+                attestation_bytes=attestation_bytes,
+                audience=statement.audience,
+                capability_digest=statement.capability_digest,
+                accepted_key_ids=verification.accepted_key_ids,
+                accepted_identities=verification.accepted_identities,
+                custody_object_id=object_id,
+                custody_reference=expected_reference,
+                lease_authority_key_fingerprint=(self._ledger.lease_authority_fingerprint),
+                receipt_signer_key_fingerprint=(self._ledger.receipt_signer_fingerprint),
+            )
+            return _VerifiedAdmission(
+                statement=statement,
+                envelope_bytes=envelope_bytes,
+                envelope_digest=envelope_digest,
+                snapshot=snapshot,
+                policy_bytes=policy_bytes,
+                policy_digest=policy_digest,
+                attestation=verification,
+                attestation_bytes=attestation_bytes,
+                request_fingerprint=request_fingerprint,
+                admitted_at=admission_time,
+                current_time=admission_time,
+                custody_object_id=object_id,
+                custody_reference=expected_reference,
+            )
+
+        stored = self._ledger.append(
             statement=statement,
-            envelope_bytes=envelope_bytes,
             envelope_digest=envelope_digest,
-            snapshot=snapshot,
-            policy_bytes=policy_bytes,
-            policy_digest=policy_digest,
-            attestation=verification,
-            attestation_bytes=attestation_bytes,
-            request_fingerprint=request_fingerprint,
-            admitted_at=_canonical_timestamp(verification_time),
-            current_time=current_time,
-            custody_object_id=object_id,
-            custody_reference=expected_reference,
+            original_admitted_at=original_time,
+            candidate_factory=candidate_for,
         )
-        stored = self._ledger.append(candidate)
         self._fault_injector(FaultPoint.AFTER_COMMIT_BEFORE_CUSTODY)
         acknowledgement = self._establish_custody(stored)
         return AdmissionOutcome(
@@ -3210,10 +4197,16 @@ class AdmissionService:
         return marked
 
     def reconcile_pending(self, *, limit: int = 100) -> int:
-        """Finish custody for committed rows after a process or network crash."""
+        """Finish prepared receipts and custody after a process or network crash."""
 
         completed = 0
-        for stored in self._ledger.pending(limit=limit):
+        for stored in self._ledger.reconcile_prepared(limit=limit):
+            self._establish_custody(stored)
+            completed += 1
+        remaining = limit - completed
+        if remaining < 1:
+            return completed
+        for stored in self._ledger.pending(limit=remaining):
             self._establish_custody(stored)
             completed += 1
         return completed
@@ -3244,6 +4237,7 @@ __all__ = [
     "FaultInjector",
     "FaultPoint",
     "JobLease",
+    "LeaseAuthorityVerifier",
     "ReceiptSigner",
     "SignedJobLease",
     "TrustPolicyResolver",

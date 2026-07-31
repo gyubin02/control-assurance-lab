@@ -1,0 +1,272 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-assurance-deployment-reconciler
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: deployment-reconciler
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-assurance-deployment-reconciler
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: deployment-reconciler
+spec:
+  replicas: 2
+  minReadySeconds: 15
+  progressDeadlineSeconds: 600
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance
+      app.kubernetes.io/component: deployment-reconciler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: control-assurance
+        app.kubernetes.io/component: deployment-reconciler
+    spec:
+      serviceAccountName: control-assurance-deployment-reconciler
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 10000
+        fsGroup: 10000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: control-assurance
+                  app.kubernetes.io/component: deployment-reconciler
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: control-assurance
+              app.kubernetes.io/component: deployment-reconciler
+      initContainers:
+        - name: materialize-pinned-database-trust
+          image: ghcr.io/gyubin02/control-assurance-lab@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - |
+              umask 077
+              test "$(id -u)" = "10000"
+              mkdir -p /trust/runtime
+              chmod 0700 /trust/runtime
+              test -s /trust-inputs/control-postgres-ca.pem
+              test -s /trust-inputs/runtime-postgres-ca.pem
+              cp /trust-inputs/control-postgres-ca.pem /trust/runtime/.control-postgres-ca.pem.new
+              cp /trust-inputs/runtime-postgres-ca.pem /trust/runtime/.postgres-ca.pem.new
+              chmod 0400 /trust/runtime/.control-postgres-ca.pem.new
+              chmod 0400 /trust/runtime/.postgres-ca.pem.new
+              mv /trust/runtime/.control-postgres-ca.pem.new /trust/runtime/control-postgres-ca.pem
+              mv /trust/runtime/.postgres-ca.pem.new /trust/runtime/postgres-ca.pem
+              chmod 0500 /trust/runtime
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: trust-inputs
+              mountPath: /trust-inputs
+              readOnly: true
+            - name: trust
+              mountPath: /trust
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: deployment-reconciler
+          image: ghcr.io/gyubin02/control-assurance-lab@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          command:
+            - assurance-deployment-reconciler
+          args:
+            - run
+            - --runtime-config
+            - /etc/control-assurance/runtime-worker.json
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: ASSURANCE_RUNTIME_CONFIG_DIGEST
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-runtime-release-pins-0f7df71a
+                  key: config-digest
+            - name: ASSURANCE_DEPLOYMENT_RECONCILER_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-deployment-reconciler-database
+                  key: control-plane-dsn
+            - name: ASSURANCE_DEPLOYMENT_RECONCILER_EXPECTED_ROLE
+              value: assurance_reconciler_runtime
+            - name: ASSURANCE_DEPLOYMENT_RECONCILER_RUNTIME_ROLE
+              value: assurance_runtime_reconciler
+            - name: ASSURANCE_CONTROL_PLANE_MIGRATION_OWNER_ROLE
+              value: assurance_migration_owner
+            - name: ASSURANCE_DEPLOYMENT_RECONCILER_CONTROL_CA_DIGEST
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-deployment-reconciler-release-pins-v1
+                  key: control-postgres-ca-digest
+            - name: ASSURANCE_DEPLOYMENT_RECONCILER_RUNTIME_CA_DIGEST
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-deployment-reconciler-release-pins-v1
+                  key: runtime-postgres-ca-digest
+            - name: RUNTIME_DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-deployment-reconciler-database
+                  key: runtime-catalog-dsn
+            - name: RUNTIME_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: RUNTIME_WORKER_CREDENTIAL_DIGEST
+              valueFrom:
+                secretKeyRef:
+                  name: control-assurance-deployment-reconciler-identity
+                  key: worker-credential-digest
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: health
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 2
+            successThreshold: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: runtime-config
+              mountPath: /etc/control-assurance
+              readOnly: true
+            - name: trust
+              mountPath: /trust
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime-config
+          configMap:
+            name: control-assurance-runtime-release-0f7df71a
+            defaultMode: 0440
+            items:
+              - key: runtime-worker.json
+                path: runtime-worker.json
+        - name: trust-inputs
+          configMap:
+            name: control-assurance-deployment-reconciler-trust-v1
+            defaultMode: 0444
+            items:
+              - key: control-postgres-ca.pem
+                path: control-postgres-ca.pem
+              - key: runtime-postgres-ca.pem
+                path: runtime-postgres-ca.pem
+        - name: trust
+          emptyDir:
+            sizeLimit: 4Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-assurance-deployment-reconciler-health
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: deployment-reconciler
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: deployment-reconciler
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: control-assurance-deployment-reconciler
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance
+    app.kubernetes.io/component: deployment-reconciler
+spec:
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: IfHealthyBudget
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance
+      app.kubernetes.io/component: deployment-reconciler

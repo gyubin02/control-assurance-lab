@@ -20,6 +20,15 @@ production data or an operating network. A digest alone does not identify the
 collector, prevent replay, create immutable custody, or grant regulatory
 compliance.
 
+The repository now also contains R2-shaped reference components: Entra OIDC
+roles, fresh-MFA maker/checker changes, tenant-bound PostgreSQL services,
+Elastic Security and Defender XDR read paths, workload-identity/PAM adapters,
+S3 Object Lock custody, Vault Transit signing, and a locked Kubernetes release
+contract. Their presence does not promote the public case to R2. No institution
+has supplied the live identities, networks, retention policy, HA/DR evidence,
+privacy corpus, external anchor, or acceptance record required by the gates
+below. Until that happens, the public demonstrated result remains R0.
+
 ## One engine, one first deployment profile
 
 The experiment and evidence engine has no Korean regulator, bank network, or

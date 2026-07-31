@@ -204,7 +204,7 @@ def test_persisted_receipts_join_one_request_from_source_rows_to_client(
 
 @pytest.mark.parametrize(
     ("target_effective", "guard_on", "sham"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_assigned_case_service_survives_every_intervention(
     runtime: FinancialSupportRuntime,
@@ -230,7 +230,7 @@ def test_assigned_case_service_survives_every_intervention(
 
 @pytest.mark.parametrize(
     ("target_effective", "guard_on"),
-    itertools.product((False, True), repeat=2),
+    tuple(itertools.product((False, True), repeat=2)),
 )
 def test_primary_attack_matrix_matches_the_independent_oracle(
     runtime: FinancialSupportRuntime,

@@ -8,7 +8,10 @@
     "node": ">=20.11"
   },
   "bin": {
-    "cab-verify": "./src/cli.js"
+    "benchmark-verify": "./src/benchmark-cli.js",
+    "cab-verify": "./src/cli.js",
+    "defender-xdr-capture-verify": "./src/defender-xdr-cli.js",
+    "elastic-capture-verify": "./src/elastic-security-cli.js"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1",
