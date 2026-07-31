@@ -205,6 +205,17 @@ jobs:
           provenance: false
           sbom: false
 
+      - name: Reject known high-impact vulnerabilities before tagging
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: control-assurance:ci
+          scanners: vuln,secret
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          version: v0.69.3
+
       - name: Exercise the immutable non-root runtime
         shell: bash
         run: |

@@ -14,8 +14,9 @@ _RELEASE_WORKFLOW = (_ROOT / ".github" / "workflows" / "release-container.yml").
 )
 _RELEASE = yaml.safe_load(_RELEASE_WORKFLOW)
 _CHECKS_WORKFLOW = (_ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
+_CHECKS = yaml.safe_load(_CHECKS_WORKFLOW)
 _DIGEST_PIN = re.compile(
-    r"^ARG PYTHON_IMAGE=python:3[.]12[.]12-slim-bookworm@"
+    r"^ARG PYTHON_IMAGE=python:3[.]12-alpine3[.]23@"
     r"sha256:[a-f0-9]{64}$",
     re.MULTILINE,
 )
@@ -276,3 +277,38 @@ def test_pull_request_checks_build_and_confine_the_real_image() -> None:
         assert f'"${{runtime[@]}}" {entrypoint} --help' in _CHECKS_WORKFLOW or (
             f'"${{runtime[@]}}" {entrypoint} --version' in _CHECKS_WORKFLOW
         )
+
+
+def test_pull_request_checks_scan_the_built_image_before_a_release_tag_exists() -> None:
+    steps = _CHECKS["jobs"]["container-contract"]["steps"]
+    matches = [
+        step
+        for step in steps
+        if step.get("name") == "Reject known high-impact vulnerabilities before tagging"
+    ]
+    assert len(matches) == 1
+    scan = matches[0]
+    assert scan["uses"] == (
+        "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25"
+    )
+    assert scan["with"] == {
+        "scan-type": "image",
+        "image-ref": "control-assurance:ci",
+        "scanners": "vuln,secret",
+        "format": "table",
+        "severity": "HIGH,CRITICAL",
+        "exit-code": "1",
+        "version": "v0.69.3",
+    }
+    build_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Build the exact production Dockerfile"
+    )
+    scan_index = steps.index(scan)
+    exercise_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Exercise the immutable non-root runtime"
+    )
+    assert build_index < scan_index < exercise_index

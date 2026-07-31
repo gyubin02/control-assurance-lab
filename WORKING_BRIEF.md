@@ -1,6 +1,8 @@
 # Working brief
 
-The repository name is provisional. This file is not a launch README.
+> This is the design brief that shaped the first public result. The release
+> gate below has been satisfied; the current product surface lives in
+> [README.md](README.md).
 
 ## The question
 
@@ -64,6 +66,6 @@ checklist items.
 
 ## Release gate
 
-There will be no first public release until the final-outcome-only baseline produces
-false assurance on the masked case and the proposed evaluator identifies the upstream
+The first public release was held until the final-outcome-only baseline produced
+false assurance on the masked case and the evaluator identified the upstream
 defect for a reason visible in the raw evidence.
