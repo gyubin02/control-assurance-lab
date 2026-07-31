@@ -211,6 +211,16 @@ jobs:
           sbom: >-
             generator=docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
 
+      - name: Canonicalize the BuildKit content-store layout
+        shell: bash
+        env:
+          LAYOUT: ${{ runner.temp }}/control-assurance-oci
+        run: |
+          # The directory output is backed by containerd's local content store,
+          # which retains an empty ingest workspace after every blob is committed.
+          # The canonicalizer refuses missing, linked, or non-empty workspaces.
+          python scripts/canonicalize-buildkit-layout.py "$LAYOUT"
+
       - name: Close the layout over both images and both attestations
         id: contract
         shell: bash

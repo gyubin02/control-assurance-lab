@@ -51,7 +51,7 @@ FROM ${PYTHON_IMAGE} AS runtime
 
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_URL=https://github.com/gyubin02/control-assurance-lab
-ARG IMAGE_VERSION=0.1.0
+ARG IMAGE_VERSION=0.1.1
 
 LABEL org.opencontainers.image.title="Control Assurance Lab" \
       org.opencontainers.image.description="Identity-bound control evidence runtime and control plane" \

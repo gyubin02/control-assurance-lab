@@ -21,8 +21,8 @@ Build the same source tree used for the source-revision label:
 docker build \
   --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
   --build-arg SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
-  --build-arg IMAGE_VERSION="0.1.0" \
-  --tag control-assurance-lab:0.1.0 \
+  --build-arg IMAGE_VERSION="0.1.1" \
+  --tag control-assurance-lab:0.1.1 \
   .
 ```
 
@@ -70,9 +70,9 @@ identity; a mutable tag is not a trust anchor.
 
 ## Verify a published release as a consumer
 
-The first published release is `v0.1.0`. Obtain the canonical `vX.Y.Z` source
-tag and `sha256:...` index digest from its GitHub Release record, then verify
-the immutable subject rather than trusting the version tag:
+The first successful container release is `v0.1.1`. Obtain the canonical
+`vX.Y.Z` source tag and `sha256:...` index digest from its GitHub Release
+record, then verify the immutable subject rather than trusting the version tag:
 
 ```sh
 REPOSITORY=gyubin02/control-assurance-lab
