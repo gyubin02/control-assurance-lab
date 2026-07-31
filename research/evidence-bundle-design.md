@@ -216,7 +216,7 @@ Illustrative root:
     "policy_digest": "sha256:<hex>",
     "evaluator": {
       "name": "assurance-lab",
-      "version": "0.1.0",
+      "version": "<evaluator-version>",
       "source_revision": "<git-commit>",
       "image_digest": "sha256:<hex>"
     }

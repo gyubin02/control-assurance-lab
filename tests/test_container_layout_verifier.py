@@ -16,7 +16,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 _VERIFIER = _ROOT / "scripts" / "verify-container-layout.py"
 _REFERENCE = "sha-deadbeef"
-_VERSION = "0.1.1"
+_VERSION = "0.1.2"
 _REVISION = "d" * 40
 _SOURCE = "https://github.com/gyubin02/control-assurance-lab"
 _EPOCH = 1_700_000_000

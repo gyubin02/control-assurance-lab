@@ -1,5 +1,6 @@
 # The tag is for readability; the manifest-list digest is the trust anchor.
-ARG PYTHON_IMAGE=python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
+# This digest resolves to Python 3.12.13 on Alpine 3.23.5 for amd64 and arm64.
+ARG PYTHON_IMAGE=python:3.12-alpine3.23@sha256:601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d
 ARG SOURCE_DATE_EPOCH=0
 
 FROM ${PYTHON_IMAGE} AS builder
@@ -51,7 +52,7 @@ FROM ${PYTHON_IMAGE} AS runtime
 
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_URL=https://github.com/gyubin02/control-assurance-lab
-ARG IMAGE_VERSION=0.1.1
+ARG IMAGE_VERSION=0.1.2
 
 LABEL org.opencontainers.image.title="Control Assurance Lab" \
       org.opencontainers.image.description="Identity-bound control evidence runtime and control plane" \
@@ -70,9 +71,9 @@ ENV HOME=/tmp \
     PYTHONUNBUFFERED=1
 
 RUN install -d \
-         --owner=10000 \
-         --group=10000 \
-         --mode=0700 \
+         -o 10000 \
+         -g 10000 \
+         -m 0700 \
          /var/lib/control-assurance \
     && rm -rf \
          /usr/local/lib/python3.12/site-packages/pip \
