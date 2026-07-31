@@ -729,18 +729,35 @@ def test_control_ui_describes_pointer_semantics_and_separate_diffs(
     page = client.get("/control/")
 
     assert page.status_code == 200
-    assert "활성 포인터 대비" in page.text
-    assert "직전 세대 대비" in page.text
-    assert "RUNTIME APPLICATION" in page.text
-    assert "배포 상태" in page.text
+    assert "Compared with active pointer" in page.text
+    assert "Compared with previous generation" in page.text
+    assert "RUNTIME STATE" in page.text
+    assert "Deployment status" in page.text
     assert 'id="deployment-operation-list"' in page.text
     assert 'id="audit-verification"' in page.text
-    assert "실행 반영을 뜻하지 않음" in page.text
+    assert "not proof of runtime application" in page.text
     assert 'id="configuration-form"' in page.text
     assert (
         'id="configuration-form" class="configuration-form" '
         'autocomplete="off" hidden'
     ) in page.text
+
+
+def test_control_ui_runtime_copy_defaults_to_english(tmp_path: Path) -> None:
+    client, _ = _application(tmp_path)
+
+    responses = [
+        client.get("/control/"),
+        client.get("/control/assets/app.js"),
+        client.get("/control/assets/model.js"),
+    ]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert '<html lang="en">' in responses[0].text
+    assert all(
+        not any("\uac00" <= character <= "\ud7a3" for character in response.text)
+        for response in responses
+    )
 
 
 def test_api_hides_cross_tenant_objects_and_internal_failures(tmp_path: Path) -> None:

@@ -14,11 +14,28 @@ const SIGNER_REFERENCE_SCHEMES = new Set([
   "vault-transit",
 ]);
 const CUSTODY_REFERENCE_SCHEMES = new Set(["s3-object-lock"]);
+const UI_DATE_FORMAT = new Intl.DateTimeFormat("en-GB", {
+  dateStyle: "medium",
+});
+const UI_DATE_TIME_FORMAT = new Intl.DateTimeFormat("en-GB", {
+  dateStyle: "medium",
+  timeStyle: "medium",
+});
+
+export function formatUiDate(value) {
+  return UI_DATE_FORMAT.format(new Date(value));
+}
+
+export function formatUiDateTime(value) {
+  return UI_DATE_TIME_FORMAT.format(new Date(value));
+}
 
 export function normalizeControlId(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (!PORTABLE_ID.test(normalized)) {
-    throw new Error("통제 ID는 소문자로 시작하고 영문·숫자·점·밑줄·대시만 쓸 수 있습니다.");
+    throw new Error(
+      "Control IDs must start with a lowercase letter and contain only lowercase letters, numbers, dots, underscores, or hyphens.",
+    );
   }
   return normalized;
 }
@@ -106,14 +123,14 @@ export function captureOperationTarget(revision, activePointer) {
     !Number.isSafeInteger(revision.state_version) ||
     revision.state_version < 0
   ) {
-    throw new Error("작업 대상 리비전이 올바르지 않습니다.");
+    throw new Error("The revision selected for this operation is invalid.");
   }
   const activePointerVersion = activePointer?.deployment_version ?? null;
   if (
     activePointerVersion !== null &&
     (!Number.isSafeInteger(activePointerVersion) || activePointerVersion < 1)
   ) {
-    throw new Error("활성 포인터 버전이 올바르지 않습니다.");
+    throw new Error("The active pointer version is invalid.");
   }
   return Object.freeze({
     activePointerVersion,
@@ -183,7 +200,7 @@ export function deploymentPresentation(desired, applied, operations) {
     return Object.freeze({
       applied,
       code: "not-configured",
-      detail: "승인된 리비전을 배포 대상으로 지정하지 않았습니다.",
+      detail: "No approved revision has been selected as the deployment target.",
       latest,
       poll: false,
       tone: "neutral",
@@ -194,7 +211,7 @@ export function deploymentPresentation(desired, applied, operations) {
       applied,
       code: "operation-missing",
       detail:
-        "희망 상태와 연결된 배포 작업을 찾지 못했습니다. 자동 반영으로 간주하지 마세요.",
+        "No deployment operation matches the desired state. Do not assume it was applied automatically.",
       latest,
       poll: false,
       tone: "failed",
@@ -206,8 +223,8 @@ export function deploymentPresentation(desired, applied, operations) {
       code: "queued",
       detail:
         applied === null || applied === undefined
-          ? "배포 작업이 대기열에 기록됐습니다. 아직 실행 시스템에 적용되지 않았습니다."
-          : "새 희망 상태가 대기 중입니다. 현재 실행 시스템에는 직전 성공 상태가 유지됩니다.",
+          ? "The deployment operation is queued. It has not yet been applied to the runtime."
+          : "A new desired state is queued. The runtime remains at the last verified state.",
       latest,
       poll: true,
       tone: "pending",
@@ -217,7 +234,7 @@ export function deploymentPresentation(desired, applied, operations) {
     return Object.freeze({
       applied,
       code: "applying",
-      detail: "조정기가 이 작업을 임대해 실행 시스템에 적용하고 있습니다.",
+      detail: "The reconciler has leased this operation and is applying it to the runtime.",
       latest,
       poll: true,
       tone: "pending",
@@ -229,8 +246,8 @@ export function deploymentPresentation(desired, applied, operations) {
       code: "failed",
       detail:
         applied === null || applied === undefined
-          ? "배포가 실패했습니다. 적용 완료 상태는 확인되지 않았습니다."
-          : "새 배포가 실패했습니다. 직전 성공 상태와 실패 증적은 그대로 보존됩니다.",
+          ? "Deployment failed. No applied state has been verified."
+          : "The new deployment failed. The last verified state and failure evidence are preserved.",
       latest,
       poll: false,
       tone: "failed",
@@ -240,7 +257,7 @@ export function deploymentPresentation(desired, applied, operations) {
     return Object.freeze({
       applied,
       code: "applied",
-      detail: "희망 상태와 실행 시스템의 확인된 적용 상태가 일치합니다.",
+      detail: "Desired state matches the runtime's verified applied state.",
       latest,
       poll: false,
       tone: "verified",
@@ -250,7 +267,7 @@ export function deploymentPresentation(desired, applied, operations) {
     applied,
     code: "unverified",
     detail:
-      "작업 기록만으로 현재 적용 상태를 증명할 수 없습니다. 조정기와 적용 영수증을 확인하세요.",
+      "The operation record alone cannot prove the current applied state. Check the reconciler and deployment receipt.",
     latest,
     poll: false,
     tone: "failed",
@@ -299,7 +316,7 @@ export function recentControlStorageKey(identity) {
     identity.subject.length < 1 ||
     identity.subject.length > 255
   ) {
-    throw new Error("최근 통제 목록을 분리할 사용자 경계가 없습니다.");
+    throw new Error("A user boundary is required to isolate the recent-controls list.");
   }
   return (
     "control-assurance.recent-controls.v2:" +
@@ -309,7 +326,9 @@ export function recentControlStorageKey(identity) {
 
 function integer(form, name) {
   const value = Number(form.get(name));
-  if (!Number.isSafeInteger(value)) throw new Error(`${name} 값은 정수여야 합니다.`);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be an integer.`);
+  }
   return value;
 }
 
@@ -336,7 +355,9 @@ function requireReference(value, schemes, label) {
     authority.includes("@") ||
     path === "/"
   ) {
-    throw new Error(`${label}에는 비밀값이 아닌 승인된 저장소 참조를 입력해야 합니다.`);
+    throw new Error(
+      `${label} must contain an approved secret-store reference, not a secret value.`,
+    );
   }
   return value;
 }
@@ -382,12 +403,14 @@ export function configurationFromEntries(entries) {
       tenant_id: String(form.get("defender_tenant_id") ?? "").trim().toLowerCase(),
     };
   } else {
-    throw new Error("지원하지 않는 탐지 원천입니다.");
+    throw new Error("Unsupported detection source.");
   }
 
   const controlProfileDigest = String(form.get("control_profile_digest") ?? "").trim();
   if (!DIGEST.test(controlProfileDigest)) {
-    throw new Error("Control profile digest는 sha256: 다음 64자리 소문자 16진수여야 합니다.");
+    throw new Error(
+      "Control profile digest must be sha256: followed by 64 lowercase hexadecimal characters.",
+    );
   }
   return {
     control_id: normalizeControlId(form.get("control_id")),

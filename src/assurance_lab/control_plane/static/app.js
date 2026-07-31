@@ -4,6 +4,8 @@ import {
   captureOperationTarget,
   configurationFromEntries,
   deploymentPresentation,
+  formatUiDate,
+  formatUiDateTime,
   hasEffectiveRole,
   normalizeControlId,
   recentControlStorageKey,
@@ -82,7 +84,7 @@ async function api(path, options = {}) {
   }
   if (!response.ok) {
     const failure = new Error(
-      body?.error?.message ?? `요청을 완료하지 못했습니다 (HTTP ${response.status}).`,
+      body?.error?.message ?? `The request could not be completed (HTTP ${response.status}).`,
     );
     failure.status = response.status;
     failure.code = body?.error?.code ?? "unknown";
@@ -222,7 +224,7 @@ function renderRevisions() {
     generation.textContent = `GEN ${String(revision.generation).padStart(2, "0")}`;
     status.textContent = stateLabel(revision.state);
     digest.textContent = shortDigest(revision.revision_id, 8);
-    time.textContent = new Date(revision.created_at).toLocaleDateString("ko-KR");
+    time.textContent = formatUiDate(revision.created_at);
     top.append(generation, status);
     bottom.append(digest, time);
     button.append(top, bottom);
@@ -342,10 +344,10 @@ function newControl(initialControlId = null) {
   toggleSource("elastic-security");
   setEditing(true);
   setText("desk-kicker", "NEW CONFIGURATION");
-  setText("desk-title", "읽기 전용 통제 정의");
+  setText("desk-title", "New control definition");
   setText(
     "desk-subtitle",
-    "자격증명은 저장하지 않습니다. 승인된 비밀 저장소의 참조만 기록합니다.",
+    "Credentials are never stored here. Only approved secret-store references are recorded.",
   );
   renderState("draft");
   renderRevisions();
@@ -362,10 +364,10 @@ function reviseSelected() {
   element("review-comment").value = "";
   setEditing(true);
   setText("desk-kicker", `NEXT GENERATION · ${state.selected.control_id}`);
-  setText("desk-title", "새 세대 초안");
+  setText("desk-title", "New generation draft");
   setText(
     "desk-subtitle",
-    "현재 선택한 세대를 기준으로 새 불변 리비전을 만듭니다. 기존 기록은 바뀌지 않습니다.",
+    "Create a new immutable revision from the selected generation. Existing records remain unchanged.",
   );
   renderState("draft");
   renderWorkflow();
@@ -400,7 +402,7 @@ function selectRevision(revision, { duringMutation = false } = {}) {
 }
 
 function valueText(value) {
-  if (value === undefined) return "(없음)";
+  if (value === undefined) return "(missing)";
   if (value === null) return "null";
   if (typeof value === "string") return value;
   return JSON.stringify(value);
@@ -441,8 +443,8 @@ function renderDifferenceList({
 function renderSelection() {
   const facts = element("selection-facts");
   const activePointer = state.activeDeployment
-    ? `${shortDigest(state.activeDeployment.revision_id, 8)} · 희망 상태 v${state.activeDeployment.deployment_version}`
-    : "없음";
+    ? `${shortDigest(state.activeDeployment.revision_id, 8)} · desired state v${state.activeDeployment.deployment_version}`
+    : "None";
   const values = state.selected
     ? [
         shortDigest(state.selected.revision_id),
@@ -451,7 +453,7 @@ function renderSelection() {
         String(state.selected.generation),
         activePointer,
       ]
-    : ["선택 안 됨", "—", "—", "—", activePointer];
+    : ["Not selected", "—", "—", "—", activePointer];
   [...facts.querySelectorAll("dd")].forEach((node, index) => {
     node.textContent = values[index];
   });
@@ -463,10 +465,10 @@ function renderSelection() {
   );
   const activeEmptyText = {
     "no-active-pointer":
-      "활성 포인터가 없습니다. 이 리비전을 지정해도 실행 반영 완료를 뜻하지 않습니다.",
-    "no-selection": "리비전을 선택하면 현재 실행 희망 상태와 비교합니다.",
-    "selected-is-active": "선택한 리비전이 현재 활성 포인터입니다.",
-  }[comparisons.activeStatus] ?? "활성 포인터와 설정 차이가 없습니다.";
+      "No active pointer exists. Selecting this revision would not prove runtime application.",
+    "no-selection": "Select a revision to compare it with the current desired state.",
+    "selected-is-active": "The selected revision is the current active pointer.",
+  }[comparisons.activeStatus] ?? "No configuration differences from the active pointer.";
   renderDifferenceList({
     countId: "difference-count",
     differences: comparisons.active,
@@ -480,26 +482,26 @@ function renderSelection() {
     emptyId: "lineage-difference-empty",
     emptyText:
       comparisons.lineageStatus === "no-parent"
-        ? "직전 세대가 없습니다."
-        : "직전 세대와 설정 차이가 없습니다.",
+        ? "No previous generation exists."
+        : "No configuration differences from the previous generation.",
     listId: "lineage-difference-list",
   });
 }
 
 function deploymentStateLabel(code) {
   return {
-    applied: "적용 확인",
-    applying: "적용 중",
-    failed: "배포 실패",
-    "not-configured": "대상 없음",
-    "operation-missing": "작업 누락",
-    queued: "대기 중",
-    unverified: "확인 필요",
-  }[code] ?? "확인 필요";
+    applied: "Applied state verified",
+    applying: "Applying",
+    failed: "Deployment failed",
+    "not-configured": "No target",
+    "operation-missing": "Operation missing",
+    queued: "Queued",
+    unverified: "Verification required",
+  }[code] ?? "Verification required";
 }
 
 function operationSummary(operation) {
-  if (!operation) return "없음";
+  if (!operation) return "None";
   const kind =
     operation.retry_of_operation_id !== null &&
     operation.retry_of_operation_id !== undefined
@@ -530,13 +532,13 @@ function renderDeployment() {
 
   const desired = state.activeDeployment
     ? `${shortDigest(state.activeDeployment.revision_id, 8)} · v${state.activeDeployment.deployment_version}`
-    : "없음";
+    : "None";
   const applied = state.appliedOperation
     ? `${shortDigest(state.appliedOperation.revision_id, 8)} · #${state.appliedOperation.operation_sequence}`
-    : "없음";
+    : "None";
   const receipt = state.appliedOperation?.target_receipt_digest
     ? shortDigest(state.appliedOperation.target_receipt_digest, 8)
-    : "없음";
+    : "None";
   const values = [
     desired,
     applied,
@@ -560,7 +562,7 @@ function renderDeployment() {
     const digest = document.createElement("span");
     title.textContent = operationSummary(operation);
     details.textContent =
-      `${new Date(operation.requested_at).toLocaleString("ko-KR")} · ` +
+      `${formatUiDateTime(operation.requested_at)} · ` +
       `${shortDigest(operation.operation_id, 8)}`;
     const lineage =
       operation.retry_of_operation_id !== null &&
@@ -592,7 +594,7 @@ function renderDeployment() {
   if (deploymentActions.includes("retry-deployment")) {
     const retry = document.createElement("button");
     retry.type = "button";
-    retry.textContent = "실패 작업 재시도";
+    retry.textContent = "Retry failed operation";
     retry.addEventListener("click", () => void runDeploymentAction("retry"));
     actions.append(retry);
   }
@@ -600,7 +602,7 @@ function renderDeployment() {
     const rollback = document.createElement("button");
     rollback.type = "button";
     rollback.className = "danger";
-    rollback.textContent = "선택 리비전으로 롤백";
+    rollback.textContent = "Roll back to selected revision";
     rollback.addEventListener("click", () => void runDeploymentAction("rollback"));
     actions.append(rollback);
   }
@@ -631,11 +633,11 @@ function renderWorkflow() {
       state.identity.groups.includes(state.selected.configuration.owner_group));
   if (canRevise) actions.push("revise");
   const labels = {
-    activate: ["활성 포인터로 지정", "primary"],
-    approve: ["승인", "primary"],
-    reject: ["반려", "danger"],
-    revise: ["새 세대로 수정", ""],
-    submit: ["검토 요청", "primary"],
+    activate: ["Set as active pointer", "primary"],
+    approve: ["Approve", "primary"],
+    reject: ["Reject", "danger"],
+    revise: ["Create next generation", ""],
+    submit: ["Submit for review", "primary"],
   };
   for (const action of actions) {
     container.append(actionButton(labels[action][0], action, labels[action][1]));
@@ -643,7 +645,7 @@ function renderWorkflow() {
   if (actions.length === 0) {
     const note = document.createElement("p");
     note.className = "empty-note";
-    note.textContent = "현재 상태와 내 역할에서 실행할 수 있는 동작이 없습니다.";
+    note.textContent = "No actions are available for your role in the current state.";
     container.append(note);
   }
   element("review-comment-wrap").hidden = !(
@@ -677,7 +679,7 @@ async function runWorkflow(action) {
   } else if (action === "approve" || action === "reject") {
     const comment = element("review-comment").value.trim();
     if (!comment) {
-      showNotice("승인·반려에는 검토 근거가 필요합니다.", true);
+      showNotice("A decision rationale is required to approve or reject.", true);
       element("review-comment").focus();
       return;
     }
@@ -697,7 +699,7 @@ async function runWorkflow(action) {
   }
   setOperationBusy(true, target);
   showNotice(
-    `${target.controlId}의 ${shortDigest(target.revisionId, 8)} 리비전에 변경을 기록하는 중입니다.`,
+    `Recording a change to revision ${shortDigest(target.revisionId, 8)} of ${target.controlId}.`,
   );
   let mutationRecorded = false;
   try {
@@ -713,15 +715,15 @@ async function runWorkflow(action) {
     element("review-comment").value = "";
     showNotice(
       action === "activate"
-        ? "활성 포인터를 기록했습니다. 실행 시스템 반영 완료를 의미하지는 않습니다."
-        : "변경을 기록하고 서버의 최신 상태를 다시 불러왔습니다.",
+        ? "The active pointer was recorded. This does not prove runtime application."
+        : "The change was recorded and the latest server state was loaded.",
     );
   } catch (error) {
     const message =
       mutationRecorded
-        ? `변경은 기록됐지만 최신 화면을 불러오지 못했습니다: ${error.message}`
+        ? `The change was recorded, but the latest state could not be loaded: ${error.message}`
         : error.code === "state-conflict"
-          ? "다른 사용자가 먼저 상태를 바꿨습니다. 최신 리비전을 다시 불러오세요."
+          ? "Another user changed the state first. Reload the latest revision."
           : error.message;
     showNotice(
       message,
@@ -776,15 +778,15 @@ async function runDeploymentAction(action) {
     path = `/api/v1/revisions/${encodeURIComponent(target.revisionId)}/rollback`;
     body = { expected_predecessor_operation_id: target.operationId };
   } else {
-    showNotice("최신 상태에서는 이 배포 동작을 실행할 수 없습니다.", true);
+    showNotice("This deployment action is not valid for the latest state.", true);
     return;
   }
 
   setOperationBusy(true, target);
   showNotice(
     action === "retry"
-      ? `실패 작업 ${shortDigest(target.operationId, 8)}의 새 재시도 의도를 기록하는 중입니다.`
-      : `${shortDigest(target.revisionId, 8)} 리비전으로의 롤백 의도를 기록하는 중입니다.`,
+      ? `Recording a new retry for failed operation ${shortDigest(target.operationId, 8)}.`
+      : `Recording an intent to roll back to revision ${shortDigest(target.revisionId, 8)}.`,
   );
   let mutationRecorded = false;
   try {
@@ -798,15 +800,15 @@ async function runDeploymentAction(action) {
     if (can("auditor")) await loadAudit({ propagate: true });
     showNotice(
       action === "retry"
-        ? "이전 실패 기록은 보존하고 새 배포 작업을 대기열에 기록했습니다."
-        : "롤백 작업을 대기열에 기록했습니다. 적용 영수증이 생기기 전에는 완료로 표시하지 않습니다.",
+        ? "A new deployment operation was queued. The previous failure record remains intact."
+        : "The rollback was queued. It will not be marked complete until a deployment receipt is recorded.",
     );
   } catch (error) {
     showNotice(
       mutationRecorded
-        ? `배포 의도는 기록됐지만 최신 상태를 불러오지 못했습니다: ${error.message}`
+        ? `The deployment intent was recorded, but the latest state could not be loaded: ${error.message}`
         : error.code === "state-conflict"
-          ? "다른 작업이 먼저 배포 상태를 바꿨습니다. 최신 상태를 다시 불러오세요."
+          ? "Another operation changed the deployment state first. Reload the latest state."
           : error.message,
       true,
     );
@@ -908,7 +910,7 @@ async function refreshDeploymentState({
       controlId === state.controlId &&
       navigationEpoch === state.navigationEpoch
     ) {
-      showNotice(`배포 상태를 갱신하지 못했습니다: ${error.message}`, true);
+      showNotice(`The deployment state could not be refreshed: ${error.message}`, true);
     }
   }
 }
@@ -956,7 +958,7 @@ async function loadControl(
         newControl(normalized);
       } else {
         form.hidden = true;
-        showNotice("이 통제에는 표시할 리비전이 없습니다.");
+        showNotice("This control has no revisions to display.");
       }
       scheduleDeploymentPoll(normalized, navigationEpoch);
       return;
@@ -977,7 +979,7 @@ async function loadAudit({ propagate = false } = {}) {
   if (!can("auditor")) return;
   const verificationNode = element("audit-verification");
   verificationNode.className = "audit-verification pending";
-  verificationNode.textContent = "감사 체인 검증 중";
+  verificationNode.textContent = "Verifying audit chain";
   try {
     const [response, verification] = await Promise.all([
       api("/api/v1/audit?limit=200"),
@@ -992,20 +994,20 @@ async function loadAudit({ propagate = false } = {}) {
       const digest = document.createElement("span");
       title.textContent = event.action;
       time.dateTime = event.occurred_at;
-      time.textContent = new Date(event.occurred_at).toLocaleString("ko-KR");
+      time.textContent = formatUiDateTime(event.occurred_at);
       digest.textContent = `#${event.sequence} · ${shortDigest(event.event_digest, 8)}`;
       item.append(title, time, digest);
       list.append(item);
     }
     verificationNode.className = "audit-verification";
     verificationNode.textContent =
-      `검증됨 · ${verification.event_count} events · head ` +
+      `Verified · ${verification.event_count} events · head ` +
       shortDigest(verification.head_event_digest, 8);
   } catch (error) {
     verificationNode.className = "audit-verification failed";
-    verificationNode.textContent = "검증 실패 · 이벤트 목록을 신뢰하지 마세요";
+    verificationNode.textContent = "Verification failed · do not trust the event list";
     if (propagate) throw error;
-    showNotice(`감사 체인을 불러오지 못했습니다: ${error.message}`, true);
+    showNotice(`The audit chain could not be loaded: ${error.message}`, true);
   }
 }
 
@@ -1027,7 +1029,7 @@ async function saveDraft(event) {
     kind: "create-revision",
   });
   setOperationBusy(true, target);
-  showNotice(`${target.controlId}의 불변 초안을 기록하는 중입니다.`);
+  showNotice(`Recording an immutable draft for ${target.controlId}.`);
   let mutationRecorded = false;
   try {
     const created = await api("/api/v1/revisions", {
@@ -1044,11 +1046,11 @@ async function saveDraft(event) {
       propagate: true,
     });
     await loadControlIndex();
-    showNotice("불변 초안을 기록하고 저장된 리비전을 다시 검증해 표시합니다.");
+    showNotice("The immutable draft was recorded and reloaded from the server.");
   } catch (error) {
     showNotice(
       mutationRecorded
-        ? `초안은 기록됐지만 최신 화면을 불러오지 못했습니다: ${error.message}`
+        ? `The draft was recorded, but the latest state could not be loaded: ${error.message}`
         : error.message,
       true,
     );
@@ -1078,7 +1080,7 @@ async function initialize() {
   element("audit-section").hidden = true;
   element("refresh-deployment").disabled = true;
   element("audit-verification").className = "audit-verification pending";
-  element("audit-verification").textContent = "체인 검증 대기 중";
+  element("audit-verification").textContent = "Awaiting chain verification";
   clearNotice();
   setOperationBusy(false);
   renderDeployment();
@@ -1088,11 +1090,11 @@ async function initialize() {
   const pendingLabel = document.createElement("span");
   pendingLight.className = "status-light pending";
   pendingLight.setAttribute("aria-hidden", "true");
-  pendingLabel.textContent = "SSO 세션 확인 중";
+  pendingLabel.textContent = "Checking SSO session";
   pendingSummary.append(pendingLight, pendingLabel);
   setText(
     "connection-state",
-    "API 확인 중 · 활성 상태는 포인터이며 실행 반영을 뜻하지 않음",
+    "Checking API · the active pointer is desired state, not proof of runtime application",
   );
   try {
     const session = await api("/api/v1/session");
@@ -1118,12 +1120,12 @@ async function initialize() {
     element("session-summary").append(light, label);
     setText(
       "connection-state",
-      "API 연결됨 · SSO verified · 활성 상태는 실행 희망 포인터",
+      "API connected · SSO verified · the active pointer represents desired state",
     );
     if (!can("viewer")) {
       element("access-denied").hidden = false;
       light.className = "status-light failed";
-      setText("connection-state", "SSO 인증됨 · 통제 조회 권한 없음");
+      setText("connection-state", "SSO authenticated · no permission to view controls");
       return;
     }
     element("new-control").hidden = !can("editor");
@@ -1161,16 +1163,16 @@ async function initialize() {
       error.status === 403 || error.code === "access-denied";
     if (authenticationFailure) {
       element("auth-required").hidden = false;
-      label.textContent = "SSO 인증 필요";
-      setText("connection-state", "인증 필요");
+      label.textContent = "SSO authentication required";
+      setText("connection-state", "Authentication required");
     } else if (authorizationFailure) {
       element("access-denied").hidden = false;
-      label.textContent = "접근 권한 없음";
-      setText("connection-state", "SSO 인증됨 · 통제 조회 권한 없음");
+      label.textContent = "Access denied";
+      setText("connection-state", "SSO authenticated · no permission to view controls");
     } else {
       element("service-unavailable").hidden = false;
-      label.textContent = "통제 API 연결 실패";
-      setText("connection-state", "서비스 연결 실패 · SSO 실패로 오인하지 않음");
+      label.textContent = "Control API unavailable";
+      setText("connection-state", "Service unavailable · not classified as an SSO failure");
     }
     summary.append(light, label);
   }

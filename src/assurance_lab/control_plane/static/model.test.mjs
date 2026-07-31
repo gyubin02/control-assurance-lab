@@ -8,6 +8,8 @@ import {
   configurationDiff,
   configurationFromEntries,
   deploymentPresentation,
+  formatUiDate,
+  formatUiDateTime,
   hasEffectiveRole,
   normalizeControlId,
   recentControlStorageKey,
@@ -23,6 +25,13 @@ test("normalizes only portable control ids", () => {
   assert.throws(() => normalizeControlId("../escape"));
   assert.throws(() => normalizeControlId("1-starts-with-number"));
   assert.equal(shortDigest(digest), "aaaaaaaaaa…aaaaaa");
+});
+
+test("formats operational timestamps in explicit English", () => {
+  const timestamp = new Date(2026, 6, 15, 12, 34, 56);
+  assert.match(formatUiDate(timestamp), /15 Jul 2026/);
+  assert.match(formatUiDateTime(timestamp), /15 Jul 2026/);
+  assert.doesNotMatch(formatUiDateTime(timestamp), /[\uAC00-\uD7A3]/u);
 });
 
 test("produces a stable leaf-level configuration difference", () => {
@@ -338,7 +347,7 @@ test("rejects raw credentials where a reference is required", () => {
   }
   assert.throws(
     () => configurationFromEntries(fields),
-    /승인된 저장소 참조/,
+    /approved secret-store reference/,
   );
 });
 
@@ -376,7 +385,7 @@ test("rejects credential-bearing references exactly as the server boundary does"
     }
     assert.throws(
       () => configurationFromEntries(fields),
-      /승인된 저장소 참조/,
+      /approved secret-store reference/,
     );
   }
 });
