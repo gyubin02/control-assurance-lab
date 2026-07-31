@@ -1,0 +1,94 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-assurance-default-deny
+  namespace: control-assurance
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Only cluster-admin-labelled ingress and monitoring namespaces can reach the
+# web process. NetworkPolicy cannot distinguish /health from application paths.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-assurance-control-plane-ingress
+  namespace: control-assurance
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              control-assurance.io/ingress-namespace: "true"
+          podSelector:
+            matchLabels:
+              control-assurance.io/ingress-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              control-assurance.io/monitoring-namespace: "true"
+          podSelector:
+            matchLabels:
+              control-assurance.io/health-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-assurance-reconciler-health-ingress
+  namespace: control-assurance
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance
+      app.kubernetes.io/component: deployment-reconciler
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              control-assurance.io/monitoring-namespace: "true"
+          podSelector:
+            matchLabels:
+              control-assurance.io/health-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-assurance-runtime-health-ingress
+  namespace: control-assurance
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: control-assurance-runtime
+      app.kubernetes.io/component: runtime-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              control-assurance.io/monitoring-namespace: "true"
+          podSelector:
+            matchLabels:
+              control-assurance.io/health-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080

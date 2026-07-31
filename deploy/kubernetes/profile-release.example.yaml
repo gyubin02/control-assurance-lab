@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-assurance-profile-release-e298279144319a96e928
+  namespace: control-assurance
+  labels:
+    app.kubernetes.io/name: control-assurance-runtime
+    app.kubernetes.io/component: profile-registrar
+    control-assurance.io/profile-manifest-digest-prefix: e298279144319a96e928
+    control-assurance.io/profile-manifest-digest-base32: 4kmcpekeggnjn2jii6b54jtgjozzwub4uk7q5cgqbpmbp6slrz3q
+  annotations:
+    control-assurance.io/profile-manifest-digest: sha256:e298279144319a96e9284783de26664bb39b503ca2bf0e88d00bd817fa4b8e77
+immutable: true
+data:
+  profile-registration-manifest.json: '{"database":{"ca_bundle":{"file":{"group_gid":10000,"mode":256,"mount_root":"/trust/runtime","owner_uid":10000,"path":"/trust/runtime/postgres-ca.pem"},"sha256_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"connect_timeout_seconds":10,"lock_timeout_ms":5000,"require_tls":true,"runtime_dsn":{"kind":"environment","name":"PROFILE_REGISTRAR_DATABASE_DSN"},"runtime_role":"control_assurance_runtime_registrar","statement_timeout_ms":15000},"kind":"control-assurance-runtime-profile-registration","profiles":[{"expected_digest":"sha256:1f5520f8a2947a96311085303c9063210ed099252a30a08ee773145123013c86","file":{"group_gid":10000,"mode":288,"mount_root":"/profiles","owner_uid":0,"path":"/profiles/elastic-high-severity-alerts-v1.json"},"media_type":"application/vnd.control-assurance.alert-window-profile.v1+json","profile_id":"elastic-high-severity-alerts-v1"}],"registrar_id":{"kind":"environment","name":"PROFILE_REGISTRAR_ID"},"schema_version":"1.0.0","tenant_id":"bank-prod"}'
+binaryData:
+  elastic-high-severity-alerts-v1.json: eyJjbGFpbV9ib3VuZGFyeSI6Im9ic2VydmVkLXNvdXJjZS13aW5kb3ctb25seSIsImNyaXRlcmlhIjpbeyJjb21wYXJpc29uIjoiZ2UiLCJjcml0ZXJpb25faWQiOiJhdC1sZWFzdC1vbmUtaGlnaC1zZXZlcml0eS1hbGVydCIsImRlc2NyaXB0aW9uIjoiT2JzZXJ2ZSBhdCBsZWFzdCBvbmUgaGlnaC1zZXZlcml0eSBhbGVydCBpbiB0aGUgY2xvc2VkIHNvdXJjZSB3aW5kb3cuIiwiZXhwZWN0ZWRfY291bnQiOjEsIm1ldHJpYyI6eyJhbGwiOlt7ImZpZWxkIjoia2liYW5hLmFsZXJ0LnNldmVyaXR5Iiwia2luZCI6ImVxdWFscyIsInZhbHVlIjoiaGlnaCJ9XSwia2luZCI6Im1hdGNoaW5nLXJlY29yZC1jb3VudCJ9fV0sIm1lZGlhX3R5cGUiOiJhcHBsaWNhdGlvbi92bmQuY29udHJvbC1hc3N1cmFuY2UuYWxlcnQtd2luZG93LXByb2ZpbGUudjEranNvbiIsInByb2ZpbGVfaWQiOiJlbGFzdGljLWhpZ2gtc2V2ZXJpdHktYWxlcnRzLXYxIiwicHJvZmlsZV92ZXJzaW9uIjoiMS4wLjAiLCJzY2hlbWFfdmVyc2lvbiI6IjEuMC4wIiwic291cmNlIjp7ImFsZXJ0X3N0YXR1c2VzIjpbXSwiZmllbGRzIjpbIkB0aW1lc3RhbXAiLCJraWJhbmEuYWxlcnQucnVsZS51dWlkIiwia2liYW5hLmFsZXJ0LnNldmVyaXR5Il0sImtpbmQiOiJlbGFzdGljLXNlY3VyaXR5IiwicnVsZV91dWlkcyI6W10sIndvcmtmbG93X3N0YXR1c2VzIjpbXX0sInRpdGxlIjoiSGlnaC1zZXZlcml0eSBhbGVydCBvYnNlcnZhdGlvbiJ9

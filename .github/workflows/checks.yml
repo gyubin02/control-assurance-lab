@@ -1,0 +1,236 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci.lock
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install
+        run: |
+          python -m pip install --only-binary=:all: --require-hashes -r requirements/ci.lock
+          python -m pip install --no-deps --no-build-isolation .
+
+      - name: Test and type-check
+        run: |
+          pip-audit --requirement requirements/ci.lock --disable-pip --progress-spinner off
+          pip-audit --requirement requirements/runtime.lock --disable-pip --progress-spinner off
+          pip-audit --requirement requirements/container-build.lock --disable-pip --progress-spinner off
+          ruff check .
+          mypy src tests
+          pytest -q
+          npm test --prefix verifier-js
+          node verifier-js/src/cli.js examples/masked-export.cab
+          node --check web/app.js
+          node --test web/app.test.js
+          node --check src/assurance_lab/control_plane/static/app.js
+          node --check src/assurance_lab/control_plane/static/model.js
+          node --test src/assurance_lab/control_plane/static/model.test.mjs
+
+      - name: Build and smoke-test release archives
+        run: |
+          python -m hatchling build --target wheel --target sdist --directory dist
+          python scripts/check-distributions.py dist
+          python -m venv /tmp/control-assurance-wheel
+          /tmp/control-assurance-wheel/bin/python -m pip install \
+            --only-binary=:all: --require-hashes -r requirements/ci.lock
+          /tmp/control-assurance-wheel/bin/python -m pip install --no-deps dist/*.whl
+          (
+            cd /tmp
+            /tmp/control-assurance-wheel/bin/assurance-lab --version
+            /tmp/control-assurance-wheel/bin/assurance-lab verify \
+              "$GITHUB_WORKSPACE/examples/masked-export.cab"
+            /tmp/control-assurance-wheel/bin/python -c \
+              'from assurance_lab.benchmark.release_builder import _derive_node_source_identity, _expected_repository_root; root = _expected_repository_root(); assert "_release_assets" in root.parts; identity = _derive_node_source_identity(root); assert identity.identity.implementation_id == "control-assurance/independent-lifecycle-semantic-verifier-js"; print(f"packaged Node verifier identity: {identity.digest}")'
+          )
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:17.7-bookworm@sha256:86e0b703649d7a792bd9243ee28afc9d8f7c6b2b5638077c9d6882d4d472bbfd
+        env:
+          POSTGRES_DB: control_assurance_test
+          POSTGRES_PASSWORD: control-assurance-integration-only
+          POSTGRES_USER: control_assurance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U control_assurance -d control_assurance_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci.lock
+
+      - name: Install
+        run: |
+          python -m pip install --only-binary=:all: --require-hashes -r requirements/ci.lock
+          python -m pip install --no-deps --no-build-isolation .
+
+      - name: Provision isolated PostgreSQL 17 topology
+        env:
+          CONTROL_ASSURANCE_POSTGRES_BOOTSTRAP_DSN: postgresql://control_assurance:control-assurance-integration-only@127.0.0.1:5432/postgres
+        run: python scripts/provision-postgres-integration.py
+
+      - name: Exercise control-plane tenant and role boundaries
+        env:
+          CONTROL_ASSURANCE_POSTGRES_ADMIN_DSN: postgresql://control_assurance:control-assurance-integration-only@127.0.0.1:5432/ca_control_integration
+          CONTROL_ASSURANCE_POSTGRES_MIGRATION_DSN: postgresql://ca_control_migration:control-migration-integration-only@127.0.0.1:5432/ca_control_integration
+          CONTROL_ASSURANCE_POSTGRES_CONTROL_DSN: postgresql://ca_control_runtime:control-runtime-integration-only@127.0.0.1:5432/ca_control_integration
+          CONTROL_ASSURANCE_POSTGRES_AUTH_DSN: postgresql://ca_auth_runtime:auth-runtime-integration-only@127.0.0.1:5432/ca_control_integration
+          CONTROL_ASSURANCE_POSTGRES_RECONCILER_DSN: postgresql://ca_reconciler_runtime:reconciler-runtime-integration-only@127.0.0.1:5432/ca_control_integration
+          CONTROL_ASSURANCE_POSTGRES_TENANT: integration-tenant
+          CONTROL_ASSURANCE_POSTGRES_MIGRATION_ROLE: ca_control_migration
+          CONTROL_ASSURANCE_POSTGRES_CONTROL_ROLE: ca_control_runtime
+          CONTROL_ASSURANCE_POSTGRES_AUTH_ROLE: ca_auth_runtime
+          CONTROL_ASSURANCE_POSTGRES_RECONCILER_ROLE: ca_reconciler_runtime
+        run: |
+          pytest -q \
+            tests/integration/test_postgres_control_plane_live.py \
+            tests/integration/test_postgres_deployment_outbox_live.py \
+            tests/integration/test_postgres_oidc_store_live.py \
+            tests/integration/test_postgres_tenant_role_boundary_live.py
+
+      - name: Exercise server-asserted runtime tenant boundaries
+        env:
+          CONTROL_ASSURANCE_POSTGRES_BOUNDARY_ADMIN_DSN: postgresql://control_assurance:control-assurance-integration-only@127.0.0.1:5432/ca_boundary_integration
+        run: pytest -q tests/integration/test_postgres_runtime_tenant_boundary_live.py
+
+      - name: Exercise separated runtime services
+        env:
+          CONTROL_ASSURANCE_POSTGRES_RUNTIME_MIGRATION_DSN: postgresql://ca_runtime_migration:runtime-migration-integration-only@127.0.0.1:5432/ca_runtime_integration
+          CONTROL_ASSURANCE_POSTGRES_RUNTIME_REGISTRAR_DSN: postgresql://ca_runtime_registrar:runtime-registrar-integration-only@127.0.0.1:5432/ca_runtime_integration
+          CONTROL_ASSURANCE_POSTGRES_RUNTIME_RECONCILER_DSN: postgresql://ca_runtime_reconciler:runtime-reconciler-integration-only@127.0.0.1:5432/ca_runtime_integration
+          CONTROL_ASSURANCE_POSTGRES_RUNTIME_WORKER_DSN: postgresql://ca_runtime_worker:runtime-worker-integration-only@127.0.0.1:5432/ca_runtime_integration
+          CONTROL_ASSURANCE_POSTGRES_RUNTIME_TENANT: integration-tenant
+        run: pytest -q tests/integration/test_postgres_runtime_live.py
+
+      - name: Exercise tenant-bound PAM journals
+        env:
+          CONTROL_ASSURANCE_POSTGRES_PAM_ADMIN_DSN: postgresql://control_assurance:control-assurance-integration-only@127.0.0.1:5432/ca_pam_integration
+          CONTROL_ASSURANCE_POSTGRES_PAM_MIGRATION_DSN: postgresql://ca_pam_migration:pam-migration-integration-only@127.0.0.1:5432/ca_pam_integration
+          CONTROL_ASSURANCE_POSTGRES_PAM_BROKER_DSN: postgresql://ca_pam_broker:pam-broker-integration-only@127.0.0.1:5432/ca_pam_integration
+          CONTROL_ASSURANCE_POSTGRES_PAM_TENANT: integration-tenant
+        run: pytest -q tests/integration/test_postgres_pam_journal_live.py
+
+      - name: Exercise worker and recovery journal separation
+        env:
+          CONTROL_ASSURANCE_POSTGRES_ADMIN_DSN: postgresql://control_assurance:control-assurance-integration-only@127.0.0.1:5432/ca_execution_integration
+          CONTROL_ASSURANCE_POSTGRES_MIGRATION_DSN: postgresql://ca_execution_migration:execution-migration-integration-only@127.0.0.1:5432/ca_execution_integration
+          CONTROL_ASSURANCE_POSTGRES_DSN: postgresql://ca_execution_worker:execution-worker-integration-only@127.0.0.1:5432/ca_execution_integration
+          CONTROL_ASSURANCE_POSTGRES_RECOVERY_DSN: postgresql://ca_execution_recovery:execution-recovery-integration-only@127.0.0.1:5432/ca_execution_integration
+          CONTROL_ASSURANCE_POSTGRES_EXECUTION_TENANT: integration-tenant
+        run: pytest -q tests/integration/test_execution_journal_live.py
+
+  container-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Derive reproducible build identity
+        id: source
+        shell: bash
+        run: |
+          git show -s --format='source_date_epoch=%ct' >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import os
+          import tomllib
+
+          with open("pyproject.toml", "rb") as stream:
+              version = tomllib.load(stream)["project"]["version"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write(f"version={version}\n")
+          PY
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build the exact production Dockerfile
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: control-assurance:ci
+          build-args: |
+            IMAGE_VERSION=${{ steps.source.outputs.version }}
+            SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
+            SOURCE_REVISION=${{ github.sha }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=checks-container
+          cache-to: type=gha,mode=max,scope=checks-container
+          provenance: false
+          sbom: false
+
+      - name: Exercise the immutable non-root runtime
+        shell: bash
+        run: |
+          test "$(docker image inspect control-assurance:ci --format '{{.Config.User}}')" = "10000:10000"
+          runtime=(
+            docker run --rm
+            --read-only
+            --network none
+            --cap-drop ALL
+            --security-opt no-new-privileges
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m
+            control-assurance:ci
+          )
+          "${runtime[@]}" assurance-lab --version
+          "${runtime[@]}" assurance-control-plane --help
+          "${runtime[@]}" assurance-runtime-worker --help
+          "${runtime[@]}" assurance-deployment-reconciler --help
+          if "${runtime[@]}" sh -eu -c 'command -v pip' >/dev/null 2>&1; then
+            echo "::error::the runtime image exposes a pip executable"
+            exit 1
+          fi
+          if "${runtime[@]}" python -m pip --version >/dev/null 2>&1; then
+            echo "::error::the runtime image still contains the pip module"
+            exit 1
+          fi
+          if "${runtime[@]}" python -m ensurepip --version >/dev/null 2>&1; then
+            echo "::error::the runtime image can recreate pip with ensurepip"
+            exit 1
+          fi

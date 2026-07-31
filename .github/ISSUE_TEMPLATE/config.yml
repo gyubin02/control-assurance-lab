@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/gyubin02/control-assurance-lab/security/advisories/new
+    about: Send a private report when public disclosure could put another user at risk.

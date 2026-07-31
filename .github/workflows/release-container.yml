@@ -1,0 +1,544 @@
+name: release container
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Each job declares only the authority it needs. In particular, neither source
+# tests nor image construction can write packages or mint an OIDC token.
+permissions: {}
+
+concurrency:
+  group: release-container-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci.lock
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Bind the canonical tag to the source version
+        id: release
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag)
+          if match is None:
+              raise SystemExit("release tag is not canonical")
+          version = match.group(1)
+          with open("pyproject.toml", "rb") as stream:
+              project_version = tomllib.load(stream)["project"]["version"]
+          if version != project_version:
+              raise SystemExit(
+                  f"tag version {version!r} does not match project {project_version!r}"
+              )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write(f"version={version}\n")
+          PY
+          git show -s --format='source_date_epoch=%ct' >> "$GITHUB_OUTPUT"
+
+      - name: Install the hash-locked quality environment
+        run: |
+          python -m pip install \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement requirements/ci.lock
+          python -m pip install --no-deps --no-build-isolation .
+
+      - name: Audit every Python dependency lock
+        shell: bash
+        run: |
+          for lock in \
+            requirements/runtime.lock \
+            requirements/container-build.lock \
+            requirements/ci.lock
+          do
+            pip-audit \
+              --requirement "$lock" \
+              --require-hashes \
+              --disable-pip \
+              --strict \
+              --progress-spinner off
+          done
+
+      - name: Enforce the dependency-free JavaScript verifier
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          package = json.loads(
+              Path("verifier-js/package.json").read_text(encoding="utf-8")
+          )
+          dependency_fields = (
+              "dependencies",
+              "devDependencies",
+              "optionalDependencies",
+              "peerDependencies",
+              "bundleDependencies",
+              "bundledDependencies",
+          )
+          populated = [
+              field for field in dependency_fields if package.get(field) not in (None, {}, [])
+          ]
+          if populated:
+              raise SystemExit(
+                  "the packaged verifier gained dependencies without a release policy: "
+                  + ", ".join(populated)
+              )
+          PY
+          npm audit \
+            --prefix verifier-js \
+            --omit=dev \
+            --no-package-lock \
+            --audit-level=high
+
+      - name: Run source, unit, static, and independent JavaScript checks
+        shell: bash
+        run: |
+          ruff check .
+          mypy src tests
+          pytest -q
+          npm test --prefix verifier-js
+          node verifier-js/src/cli.js examples/masked-export.cab
+          node --check web/app.js
+          node --test web/app.test.js
+          node --check src/assurance_lab/control_plane/static/app.js
+          node --check src/assurance_lab/control_plane/static/model.js
+          node --test src/assurance_lab/control_plane/static/model.test.mjs
+
+      - name: Build and smoke-test the release distributions
+        shell: bash
+        run: |
+          python -m hatchling build --target wheel --target sdist --directory dist
+          python scripts/check-distributions.py dist
+          python -m venv /tmp/control-assurance-wheel
+          /tmp/control-assurance-wheel/bin/python -m pip install \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement requirements/ci.lock
+          /tmp/control-assurance-wheel/bin/python -m pip install \
+            --no-deps \
+            dist/*.whl
+          (
+            cd /tmp
+            /tmp/control-assurance-wheel/bin/assurance-lab --version
+            /tmp/control-assurance-wheel/bin/assurance-lab verify \
+              "$GITHUB_WORKSPACE/examples/masked-export.cab"
+            /tmp/control-assurance-wheel/bin/python -c \
+              'from assurance_lab.benchmark.release_builder import _derive_node_source_identity, _expected_repository_root; root = _expected_repository_root(); assert "_release_assets" in root.parts; identity = _derive_node_source_identity(root); assert identity.identity.implementation_id == "control-assurance/independent-lifecycle-semantic-verifier-js"; print(f"packaged Node verifier identity: {identity.digest}")'
+          )
+
+  build-scan:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      amd64_digest: ${{ steps.contract.outputs.amd64_digest }}
+      archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
+      arm64_digest: ${{ steps.contract.outputs.arm64_digest }}
+      index_digest: ${{ steps.contract.outputs.index_digest }}
+      local_reference: ${{ steps.contract.outputs.local_reference }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+          cache-image: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.36.0
+          driver-opts: >-
+            image=moby/buildkit:v0.32.0@sha256:1f8167fcb0eca5b7126353d35299386945cbb8949cc516c592a49f80cfce4fa2
+
+      - name: Build the unpublished multi-platform OCI layout
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: control-assurance-release:sha-${{ github.sha }}
+          outputs: >-
+            type=oci,dest=${{ runner.temp }}/control-assurance-oci,tar=false,oci-artifact=false
+          build-args: |
+            IMAGE_VERSION=${{ needs.quality.outputs.version }}
+            SOURCE_DATE_EPOCH=${{ needs.quality.outputs.source_date_epoch }}
+            SOURCE_REVISION=${{ github.sha }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=release-container
+          cache-to: type=gha,mode=max,scope=release-container
+          provenance: mode=max
+          sbom: >-
+            generator=docker/buildkit-syft-scanner@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
+
+      - name: Close the layout over both images and both attestations
+        id: contract
+        shell: bash
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          LOCAL_REFERENCE: sha-${{ github.sha }}
+          LAYOUT: ${{ runner.temp }}/control-assurance-oci
+          METADATA: ${{ runner.temp }}/control-assurance-layout.json
+          PLATFORM_INDEXES: ${{ runner.temp }}/control-assurance-platform-indexes
+          SOURCE_DATE_EPOCH: ${{ needs.quality.outputs.source_date_epoch }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ needs.quality.outputs.version }}
+        run: |
+          python scripts/verify-container-layout.py \
+            "$LAYOUT" \
+            --reference "$LOCAL_REFERENCE" \
+            --version "$VERSION" \
+            --revision "$GITHUB_SHA" \
+            --source "$SOURCE_URL" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --metadata "$METADATA" \
+            --platform-index-directory "$PLATFORM_INDEXES"
+          python - <<'PY'
+          import json
+          import os
+
+          with open(os.environ["METADATA"], encoding="utf-8") as stream:
+              metadata = json.load(stream)
+          if metadata["index_digest"] != os.environ["BUILD_DIGEST"]:
+              raise SystemExit("Buildx digest disagrees with the verified OCI index")
+          platforms = {
+              entry["platform"]: entry["manifest_digest"]
+              for entry in metadata["platforms"]
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write(f"index_digest={metadata['index_digest']}\n")
+              stream.write(f"amd64_digest={platforms['linux/amd64']}\n")
+              stream.write(f"arm64_digest={platforms['linux/arm64']}\n")
+              stream.write(f"local_reference={metadata['reference']}\n")
+          PY
+          cp "$LAYOUT/index.json" "$RUNNER_TEMP/control-assurance-release-index.json"
+
+      # Trivy v0.69.3 does not reliably select a platform nested in a local OCI
+      # index. Each temporary view therefore contains one already-verified
+      # platform descriptor and the same content-addressed blob directory.
+      - name: Select the exact amd64 scan view
+        shell: bash
+        run: >-
+          cp
+          "$RUNNER_TEMP/control-assurance-platform-indexes/linux-amd64.json"
+          "$RUNNER_TEMP/control-assurance-oci/index.json"
+
+      - name: Reject known high-impact vulnerabilities on amd64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/control-assurance-oci
+          scanners: vuln,secret
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          version: v0.69.3
+
+      - name: Select the exact arm64 scan view
+        shell: bash
+        run: >-
+          cp
+          "$RUNNER_TEMP/control-assurance-platform-indexes/linux-arm64.json"
+          "$RUNNER_TEMP/control-assurance-oci/index.json"
+
+      - name: Reject known high-impact vulnerabilities on arm64
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/control-assurance-oci
+          scanners: vuln,secret
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          version: v0.69.3
+          skip-setup-trivy: true
+
+      - name: Restore and re-verify the scanned release index
+        shell: bash
+        env:
+          LAYOUT: ${{ runner.temp }}/control-assurance-oci
+          LOCAL_REFERENCE: sha-${{ github.sha }}
+          SOURCE_DATE_EPOCH: ${{ needs.quality.outputs.source_date_epoch }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ needs.quality.outputs.version }}
+        run: |
+          cp "$RUNNER_TEMP/control-assurance-release-index.json" "$LAYOUT/index.json"
+          python scripts/verify-container-layout.py \
+            "$LAYOUT" \
+            --reference "$LOCAL_REFERENCE" \
+            --version "$VERSION" \
+            --revision "$GITHUB_SHA" \
+            --source "$SOURCE_URL" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --metadata "$RUNNER_TEMP/control-assurance-layout-after-scan.json"
+          cmp \
+            "$RUNNER_TEMP/control-assurance-layout.json" \
+            "$RUNNER_TEMP/control-assurance-layout-after-scan.json"
+
+      - name: Package the exact scanned layout
+        id: package
+        shell: bash
+        env:
+          ARCHIVE: ${{ runner.temp }}/control-assurance-release.oci.tar
+          LAYOUT: ${{ runner.temp }}/control-assurance-oci
+          LOCAL_REFERENCE: sha-${{ github.sha }}
+          SOURCE_DATE_EPOCH: ${{ needs.quality.outputs.source_date_epoch }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          VERSION: ${{ needs.quality.outputs.version }}
+        run: |
+          tar \
+            --sort=name \
+            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --format=posix \
+            --pax-option=delete=atime,delete=ctime \
+            --create \
+            --file "$ARCHIVE" \
+            --directory "$LAYOUT" \
+            .
+          python scripts/verify-container-layout.py \
+            "$ARCHIVE" \
+            --reference "$LOCAL_REFERENCE" \
+            --version "$VERSION" \
+            --revision "$GITHUB_SHA" \
+            --source "$SOURCE_URL" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --metadata "$RUNNER_TEMP/control-assurance-archive-layout.json"
+          cmp \
+            "$RUNNER_TEMP/control-assurance-layout.json" \
+            "$RUNNER_TEMP/control-assurance-archive-layout.json"
+          archive_sha256="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+          echo "archive_sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the exact OCI tar to the privileged job
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ runner.temp }}/control-assurance-release.oci.tar
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Bind the artifact service digest to the scanned tar
+        shell: bash
+        env:
+          EXPECTED: ${{ steps.package.outputs.archive_sha256 }}
+          UPLOADED: ${{ steps.upload.outputs.artifact-digest }}
+        run: test "$UPLOADED" = "$EXPECTED"
+
+  publish:
+    needs:
+      - quality
+      - build-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download the exact scanned OCI tar without re-archiving it
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: control-assurance-release.oci.tar
+          path: ${{ runner.temp }}/release
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Rebind the downloaded bytes to the scan job
+        shell: bash
+        env:
+          ARCHIVE: ${{ runner.temp }}/release/control-assurance-release.oci.tar
+          EXPECTED: ${{ needs.build-scan.outputs.archive_sha256 }}
+        run: |
+          test -f "$ARCHIVE"
+          observed="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+          test "$observed" = "$EXPECTED"
+
+      - name: Install the checksum-pinned ORAS client
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/oras/bin"
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --output "$RUNNER_TEMP/oras/oras.tgz" \
+            https://github.com/oras-project/oras/releases/download/v1.3.2/oras_1.3.2_linux_amd64.tar.gz
+          echo \
+            "9229ccc6d17bb282039ad4a69abb16dcb887a5bce567c075d731d9b3c7ad8eaf  $RUNNER_TEMP/oras/oras.tgz" \
+            | sha256sum --check --strict
+          tar \
+            --extract \
+            --gzip \
+            --file "$RUNNER_TEMP/oras/oras.tgz" \
+            --directory "$RUNNER_TEMP/oras/bin" \
+            oras
+          echo "$RUNNER_TEMP/oras/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the local OCI subject before registry access
+        shell: bash
+        env:
+          ARCHIVE: ${{ runner.temp }}/release/control-assurance-release.oci.tar
+          EXPECTED: ${{ needs.build-scan.outputs.index_digest }}
+          LOCAL_REFERENCE: ${{ needs.build-scan.outputs.local_reference }}
+        run: |
+          observed="$(
+            oras resolve \
+              --oci-layout \
+              "$ARCHIVE:$LOCAL_REFERENCE"
+          )"
+          test "$observed" = "$EXPECTED"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the exact scanned index under a run-unique candidate tag
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ needs.build-scan.outputs.amd64_digest }}
+          ARCHIVE: ${{ runner.temp }}/release/control-assurance-release.oci.tar
+          ARM64_DIGEST: ${{ needs.build-scan.outputs.arm64_digest }}
+          INDEX_DIGEST: ${{ needs.build-scan.outputs.index_digest }}
+          LOCAL_REFERENCE: ${{ needs.build-scan.outputs.local_reference }}
+        run: |
+          candidate="${IMAGE}:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
+          error_file="$RUNNER_TEMP/candidate-resolve-error"
+          if existing="$(oras resolve "$candidate" 2>"$error_file")"; then
+            echo "candidate tag already exists at $existing" >&2
+            exit 1
+          fi
+          if ! grep -Eqi '(not found|manifest unknown)' "$error_file"; then
+            cat "$error_file" >&2
+            exit 1
+          fi
+          oras cp \
+            --from-oci-layout \
+            "$ARCHIVE:$LOCAL_REFERENCE" \
+            "$candidate"
+          test "$(oras resolve "$candidate")" = "$INDEX_DIGEST"
+          test "$(
+            oras resolve --platform linux/amd64 "${IMAGE}@${INDEX_DIGEST}"
+          )" = "$AMD64_DIGEST"
+          test "$(
+            oras resolve --platform linux/arm64 "${IMAGE}@${INDEX_DIGEST}"
+          )" = "$ARM64_DIGEST"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      - name: Sign the immutable image index
+        shell: bash
+        run: >-
+          cosign sign --yes
+          "${IMAGE}@${{ needs.build-scan.outputs.index_digest }}"
+
+      - name: Publish GitHub build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ needs.build-scan.outputs.index_digest }}
+          push-to-registry: true
+          # Artifact Metadata Storage Records are organization-only. The OCI
+          # attestation and repository attestation remain published.
+          create-storage-record: false
+
+      - name: Verify the published signature identity
+        shell: bash
+        run: |
+          cosign verify \
+            --certificate-identity \
+              "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/release-container.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "${IMAGE}@${{ needs.build-scan.outputs.index_digest }}"
+
+      - name: Verify the published GitHub provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh attestation verify \
+            "oci://${IMAGE}@${{ needs.build-scan.outputs.index_digest }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --bundle-from-oci \
+            --signer-workflow \
+              "${GITHUB_REPOSITORY}/.github/workflows/release-container.yml" \
+            --source-ref "${GITHUB_REF}" \
+            --source-digest "${GITHUB_SHA}"
+
+      # A stable version tag is created only from the already-signed digest.
+      # A prior different digest is a release collision, never an overwrite.
+      - name: Promote the verified digest without rewriting a version
+        shell: bash
+        env:
+          INDEX_DIGEST: ${{ needs.build-scan.outputs.index_digest }}
+          VERSION: ${{ needs.quality.outputs.version }}
+        run: |
+          version_ref="${IMAGE}:${VERSION}"
+          error_file="$RUNNER_TEMP/version-resolve-error"
+          if existing="$(oras resolve "$version_ref" 2>"$error_file")"; then
+            test "$existing" = "$INDEX_DIGEST"
+          else
+            if ! grep -Eqi '(not found|manifest unknown)' "$error_file"; then
+              cat "$error_file" >&2
+              exit 1
+            fi
+            oras cp "${IMAGE}@${INDEX_DIGEST}" "$version_ref"
+          fi
+          test "$(oras resolve "$version_ref")" = "$INDEX_DIGEST"

@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="Control Assurance configuration change desk">
+    <title>Control Assurance — Change desk</title>
+    <link rel="stylesheet" href="/control/assets/styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to main content</a>
+    <header class="masthead">
+      <div class="wordmark">
+        <span class="wordmark-mark" aria-hidden="true">CA</span>
+        <span>
+          <strong>Control Assurance</strong>
+          <small>Change desk</small>
+        </span>
+      </div>
+      <div class="session-summary" id="session-summary" aria-live="polite">
+        <span class="status-light pending" aria-hidden="true"></span>
+        <span>Checking SSO session</span>
+      </div>
+    </header>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <aside class="ledger-rail" aria-label="Control selection and revision history">
+        <div class="rail-heading">
+          <p class="eyebrow">CONTROL LEDGER</p>
+          <button class="quiet-button" id="new-control" type="button" hidden>New control</button>
+        </div>
+        <form id="control-search" class="control-search">
+          <label for="control-id-search">Control ID</label>
+          <div class="joined-field">
+            <input
+              id="control-id-search"
+              name="control_id"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="elastic-alert-completeness"
+              pattern="[a-z][a-z0-9._-]{0,127}"
+              required
+              disabled
+            >
+            <button type="submit" disabled>Open</button>
+          </div>
+        </form>
+        <div class="rail-section">
+          <h2>Registered controls</h2>
+          <ol id="recent-controls" class="control-list"></ol>
+          <p id="recent-empty" class="empty-note">No controls have been registered.</p>
+        </div>
+        <div class="rail-section revisions-section">
+          <div class="section-line">
+            <h2>Revision history</h2>
+            <span id="revision-count" class="count">0</span>
+          </div>
+          <ol id="revision-list" class="revision-list"></ol>
+          <p id="revision-empty" class="empty-note">Open a control to view its immutable revisions.</p>
+        </div>
+      </aside>
+
+      <section class="change-desk" aria-labelledby="desk-title">
+        <div class="desk-heading">
+          <div>
+            <p class="eyebrow" id="desk-kicker">NEW CONFIGURATION</p>
+            <h1 id="desk-title">Read-only control definition</h1>
+            <p id="desk-subtitle">
+              Credentials are never stored here. Only approved secret-store references are recorded.
+            </p>
+          </div>
+          <div id="revision-state" class="state-stamp draft">DRAFT</div>
+        </div>
+
+        <div
+          id="notice"
+          class="notice"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          tabindex="-1"
+          hidden
+        ></div>
+        <div id="auth-required" class="auth-required" role="alert" hidden>
+          <p class="eyebrow">SESSION REQUIRED</p>
+          <h2>Sign in with your organization's SSO.</h2>
+          <p>Development logins and local administrator bypasses are not available.</p>
+          <a class="primary-link" href="/auth/login?return_to=%2Fcontrol%2F">Sign in with SSO</a>
+        </div>
+        <div id="service-unavailable" class="auth-required" role="alert" hidden>
+          <p class="eyebrow">SERVICE UNAVAILABLE</p>
+          <h2>The Control API is unavailable.</h2>
+          <p>This is not necessarily an SSO failure. Wait a moment, then try the connection again.</p>
+          <button class="primary-button" id="retry-initialize" type="button">Try again</button>
+        </div>
+        <div id="access-denied" class="auth-required" role="alert" hidden>
+          <p class="eyebrow">ACCESS DENIED</p>
+          <h2>You cannot view controls in this tenant.</h2>
+          <p>SSO authentication succeeded, but the viewer or administrator role is required.</p>
+        </div>
+
+        <form id="configuration-form" class="configuration-form" autocomplete="off" hidden>
+          <fieldset>
+            <legend><span>01</span> Ownership</legend>
+            <div class="field-grid two">
+              <label>
+                <span>Tenant ID</span>
+                <input name="tenant_id" required pattern="[a-z][a-z0-9._-]{0,127}">
+              </label>
+              <label>
+                <span>Control ID</span>
+                <input name="control_id" required pattern="[a-z][a-z0-9._-]{0,127}">
+              </label>
+              <label class="wide">
+                <span>Display name</span>
+                <input name="display_name" maxlength="160" required>
+              </label>
+              <label class="wide">
+                <span>Purpose</span>
+                <textarea name="description" rows="3" maxlength="2000" required></textarea>
+              </label>
+              <label>
+                <span>Environment</span>
+                <select name="environment">
+                  <option value="production">Production</option>
+                  <option value="staging">Staging</option>
+                  <option value="test">Test</option>
+                  <option value="development">Development</option>
+                </select>
+              </label>
+              <label>
+                <span>Owner group</span>
+                <input name="owner_group" placeholder="secops/platform" required>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend><span>02</span> Detection source</legend>
+            <div class="source-switch" role="radiogroup" aria-label="Detection source">
+              <label>
+                <input type="radio" name="source_kind" value="elastic-security" checked>
+                <span>Elastic Security</span>
+              </label>
+              <label>
+                <input type="radio" name="source_kind" value="defender-xdr">
+                <span>Microsoft Defender XDR</span>
+              </label>
+            </div>
+
+            <div id="elastic-fields" class="field-grid two source-fields">
+              <label class="wide">
+                <span>Elasticsearch HTTPS origin</span>
+                <input
+                  name="elastic_endpoint_origin"
+                  type="url"
+                  placeholder="https://elastic.example"
+                >
+              </label>
+              <label>
+                <span>Security alert alias</span>
+                <input
+                  name="elastic_index_alias"
+                  value=".alerts-security.alerts-default"
+                  spellcheck="false"
+                >
+              </label>
+              <label>
+                <span>JIT parent credential ref</span>
+                <input
+                  name="elastic_parent_credential_ref"
+                  placeholder="vault://kv/secops/elastic-jit-parent"
+                  spellcheck="false"
+                >
+                <small>Enter a Vault, Key Vault, or Secrets Manager reference—not a secret value.</small>
+              </label>
+              <label>
+                <span>JIT lease</span>
+                <div class="number-unit">
+                  <input name="elastic_lease_ttl_seconds" type="number" value="900" min="600" max="3600">
+                  <span>seconds</span>
+                </div>
+              </label>
+              <label>
+                <span>CA bundle ref <em>optional</em></span>
+                <input
+                  name="elastic_ca_bundle_ref"
+                  placeholder="vault://pki/secops/elastic-ca"
+                  spellcheck="false"
+                >
+              </label>
+            </div>
+
+            <div id="defender-fields" class="field-grid two source-fields" hidden>
+              <label>
+                <span>Entra tenant ID</span>
+                <input name="defender_tenant_id" spellcheck="false">
+              </label>
+              <label>
+                <span>Application client ID</span>
+                <input name="defender_client_id" spellcheck="false">
+              </label>
+              <label>
+                <span>Cloud</span>
+                <select name="defender_cloud">
+                  <option value="global">Global</option>
+                  <option value="us-government-l4">US Government L4</option>
+                  <option value="us-government-l5">US Government L5</option>
+                </select>
+              </label>
+              <label>
+                <span>Client credential ref</span>
+                <input
+                  name="defender_client_credential_ref"
+                  placeholder="azure-keyvault://security/defender-client"
+                  spellcheck="false"
+                >
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend><span>03</span> Execution and evidence</legend>
+            <div class="field-grid two">
+              <label>
+                <span>Run interval</span>
+                <div class="number-unit">
+                  <input name="interval_seconds" type="number" value="900" min="60" max="86400">
+                  <span>seconds</span>
+                </div>
+              </label>
+              <label>
+                <span>Verification window</span>
+                <div class="number-unit">
+                  <input name="window_seconds" type="number" value="900" min="60" max="86400">
+                  <span>seconds</span>
+                </div>
+              </label>
+              <label>
+                <span>Collection lag allowance</span>
+                <div class="number-unit">
+                  <input name="collection_lag_seconds" type="number" value="120" min="0" max="3600">
+                  <span>seconds</span>
+                </div>
+              </label>
+              <label>
+                <span>Retention period</span>
+                <div class="number-unit">
+                  <input name="retention_days" type="number" value="365" min="30" max="3650">
+                  <span>days</span>
+                </div>
+              </label>
+              <label>
+                <span>Control profile ID</span>
+                <input name="control_profile_id" placeholder="alert-window-v1" required>
+              </label>
+              <label>
+                <span>Profile digest</span>
+                <input
+                  name="control_profile_digest"
+                  placeholder="sha256:…"
+                  pattern="sha256:[a-f0-9]{64}"
+                  spellcheck="false"
+                  required
+                >
+              </label>
+              <label>
+                <span>Signing key ref</span>
+                <input
+                  name="signing_key_ref"
+                  placeholder="vault-transit://assurance/signing/elastic-prod"
+                  spellcheck="false"
+                  required
+                >
+              </label>
+              <label>
+                <span>Object Lock custody ref</span>
+                <input
+                  name="custody_ref"
+                  placeholder="s3-object-lock://assurance-evidence/acme/elastic"
+                  spellcheck="false"
+                  required
+                >
+              </label>
+              <label class="check-line">
+                <input name="legal_hold" type="checkbox">
+                <span>Apply legal hold by default</span>
+              </label>
+              <label class="check-line">
+                <input name="enabled" type="checkbox" checked>
+                <span>Allow execution when selected by the active pointer</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="form-foot">
+            <div>
+              <span class="integrity-label">IMMUTABLE REVISION</span>
+              <p>Saving creates a new generation. Existing configuration remains unchanged.</p>
+            </div>
+            <button id="save-draft" class="primary-button" type="submit">Create draft</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="review-pane" aria-label="Review and active pointer">
+        <section>
+          <p class="eyebrow">CURRENT SELECTION</p>
+          <h2>Revision summary</h2>
+          <dl id="selection-facts" class="selection-facts">
+            <div><dt>Revision</dt><dd>Not selected</dd></div>
+            <div><dt>Configuration digest</dt><dd>—</dd></div>
+            <div><dt>Created by</dt><dd>—</dd></div>
+            <div><dt>Generation</dt><dd>—</dd></div>
+            <div><dt>Active pointer</dt><dd>None</dd></div>
+          </dl>
+        </section>
+
+        <section id="deployment-section">
+          <div class="section-line">
+            <div>
+              <p class="eyebrow">RUNTIME STATE</p>
+              <h2>Deployment status</h2>
+            </div>
+            <button class="quiet-button" id="refresh-deployment" type="button" disabled>Refresh</button>
+          </div>
+          <div id="deployment-status" class="deployment-status neutral" aria-live="polite">
+            <div>
+              <span id="deployment-light" class="status-light pending" aria-hidden="true"></span>
+              <strong id="deployment-label">No target</strong>
+            </div>
+            <p id="deployment-detail">Open a control to compare desired state with the verified applied state.</p>
+          </div>
+          <dl id="deployment-facts" class="selection-facts deployment-facts">
+            <div><dt>Desired state</dt><dd>None</dd></div>
+            <div><dt>Verified applied state</dt><dd>None</dd></div>
+            <div><dt>Latest operation</dt><dd>None</dd></div>
+            <div><dt>Deployment receipt</dt><dd>None</dd></div>
+          </dl>
+          <div id="deployment-actions" class="workflow-actions"></div>
+          <ol id="deployment-operation-list" class="deployment-operation-list"></ol>
+          <p id="deployment-operation-empty" class="empty-note">No deployment operations have been recorded.</p>
+        </section>
+
+        <section>
+          <div class="section-line">
+            <h2>Compared with active pointer</h2>
+            <span id="difference-count" class="count">0</span>
+          </div>
+          <ol id="difference-list" class="difference-list"></ol>
+          <p id="difference-empty" class="empty-note">Select a revision to compare it with the current desired state.</p>
+        </section>
+
+        <section>
+          <div class="section-line">
+            <h2>Compared with previous generation</h2>
+            <span id="lineage-difference-count" class="count">0</span>
+          </div>
+          <ol id="lineage-difference-list" class="difference-list"></ol>
+          <p id="lineage-difference-empty" class="empty-note">When a parent generation exists, only changed fields are shown.</p>
+        </section>
+
+        <section id="workflow-section">
+          <h2>Workflow</h2>
+          <div id="workflow-actions" class="workflow-actions">
+            <p class="empty-note">Only actions allowed by your role and the current state are shown.</p>
+          </div>
+          <label id="review-comment-wrap" class="review-comment" hidden>
+            <span>Decision rationale</span>
+            <textarea id="review-comment" rows="4" maxlength="2000" disabled></textarea>
+          </label>
+        </section>
+
+        <section id="audit-section" hidden>
+          <div class="section-line">
+            <h2>Audit chain</h2>
+            <button class="quiet-button" id="refresh-audit" type="button" disabled>Refresh</button>
+          </div>
+          <p id="audit-verification" class="audit-verification pending" role="status">
+            Awaiting chain verification
+          </p>
+          <ol id="audit-list" class="audit-list"></ol>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="footer">
+      <span>Control state is append-only. Secrets remain in their system of record.</span>
+      <span id="connection-state">Checking API · the active pointer is desired state, not proof of runtime application</span>
+    </footer>
+    <script type="module" src="/control/assets/app.js"></script>
+  </body>
+</html>

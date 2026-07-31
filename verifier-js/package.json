@@ -1,0 +1,20 @@
+{
+  "name": "cab-integrity-verifier",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Independent, dependency-free integrity verifier for Control Assurance Bundles",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "benchmark-verify": "./src/benchmark-cli.js",
+    "cab-verify": "./src/cli.js",
+    "defender-xdr-capture-verify": "./src/defender-xdr-cli.js",
+    "elastic-capture-verify": "./src/elastic-security-cli.js"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1",
+    "verify:example": "node ./src/cli.js ../examples/masked-export.cab"
+  }
+}

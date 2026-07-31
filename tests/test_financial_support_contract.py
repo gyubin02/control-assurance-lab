@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from assurance_lab.contract import (
     CellSelector,
+    CompiledExperiment,
     ContrastId,
     EvidencePolicyRef,
     EvidenceWindow,
@@ -30,7 +31,7 @@ def _digest(fill: str) -> str:
     return f"sha256:{fill * 64}"
 
 
-def _compiled():
+def _compiled() -> CompiledExperiment:
     start = datetime(2026, 7, 28, 0, 0, tzinfo=UTC)
     scope = ExperimentScope(
         scenario_id=SCENARIO_ID,

@@ -13,6 +13,11 @@ const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
 const MAX_MANIFEST_FILES = 10_000;
 const MAX_FILE_BYTES = 512 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
+const FIXTURE_SCHEMA = "assurance-lab.financial-support-fixture/v3";
+const DATASET_SCHEMA = "assurance-lab.financial-support-runtime-dataset/v1";
+const RUNTIME_OBSERVATION_SCHEMA =
+  "assurance-lab.financial-support-runtime-observation/v1";
+const RUNNER_RESOURCE_ID = "financial-support-sqlite-runner";
 
 const required = (value, path) => {
   if (value === undefined || value === null || value === "") {
@@ -84,6 +89,43 @@ const parseJsonBytes = (bytes, label) => {
       throw new Error(`${label} is not valid JSON`);
     }
     throw error;
+  }
+};
+
+const canonicalJsonText = (value) => {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error("Verified evidence contains a number outside the exact integer domain");
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJsonText).join(",")}]`;
+  }
+  if (typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${canonicalJsonText(value[key])}`,
+      )
+      .join(",")}}`;
+  }
+  throw new Error("Verified evidence contains a value outside the JSON domain");
+};
+
+const canonicalJsonBytes = (value) =>
+  new TextEncoder().encode(canonicalJsonText(value));
+
+const sameJson = (left, right) =>
+  canonicalJsonText(left) === canonicalJsonText(right);
+
+const assertJsonEqual = (actual, expected, label) => {
+  if (!sameJson(actual, expected)) {
+    throw new Error(`${label} disagrees with the verified raw runtime evidence`);
   }
 };
 
@@ -248,6 +290,18 @@ const verifyBundle = async (caseData) => {
     payloads.get("spec/fixture-manifest.json"),
     "verified fixture manifest",
   );
+  const datasetManifestBytes = required(
+    payloads.get("spec/dataset-manifest.json"),
+    "verified dataset generator manifest",
+  );
+  const runtimeDatasetBytes = required(
+    payloads.get("spec/runtime-dataset.json"),
+    "verified runtime dataset",
+  );
+  const runtimeObservationBytes = required(
+    payloads.get("records/runtime-observations.jsonl"),
+    "verified raw runtime observations",
+  );
   const attestationBytes = required(
     payloads.get("artifacts/trial-attestations.jsonl"),
     "verified trial attestations",
@@ -260,30 +314,58 @@ const verifyBundle = async (caseData) => {
     throw new Error("Verified experiment spec does not match the case result");
   }
 
+  const spec = parseJsonBytes(specBytes, "spec/experiment.json");
+  const fixture = parseJsonBytes(
+    fixtureBytes,
+    "spec/fixture-manifest.json",
+  );
+  const runtimeDataset = await verifyFixtureAndDataset({
+    fixture,
+    fixtureBytes,
+    datasetManifestBytes,
+    runtimeDatasetBytes,
+    spec,
+  });
+  const attestations = parseTrialAttestations(
+    attestationBytes,
+    manifest,
+    caseData,
+  );
+  const runtimeIndex = await parseRuntimeObservations(
+    runtimeObservationBytes,
+    manifest,
+    attestations,
+    fixture,
+    runtimeDataset,
+    spec,
+  );
+
   return {
     bundleRoot,
     manifest,
     payloads,
     specBytes,
-    spec: parseJsonBytes(specBytes, "spec/experiment.json"),
-    fixture: parseJsonBytes(fixtureBytes, "spec/fixture-manifest.json"),
+    spec,
+    fixture,
+    runtimeDataset,
+    runtimeIndex,
     stageIndex: await parseStageEvents(stageBytes, manifest, caseData),
-    attestations: parseTrialAttestations(attestationBytes, manifest, caseData),
+    attestations,
   };
 };
 
-const splitJsonLines = (bytes) => {
+const splitJsonLines = (bytes, label = "JSONL evidence") => {
   const lines = [];
   let start = 0;
   for (let index = 0; index <= bytes.length; index += 1) {
     if (index !== bytes.length && bytes[index] !== 0x0a) continue;
     if (index === start) {
       if (index === bytes.length) break;
-      throw new Error("records/stage-events.jsonl contains a blank line");
+      throw new Error(`${label} contains a blank line`);
     }
     const line = bytes.slice(start, index);
     if (line[line.length - 1] === 0x0d) {
-      throw new Error("records/stage-events.jsonl is not canonical JSONL");
+      throw new Error(`${label} is not canonical JSONL`);
     }
     lines.push(line);
     start = index + 1;
@@ -301,9 +383,519 @@ const typedSelectorValue = (value, expectedType, path) => {
   return typed.value;
 };
 
+const requiredText = (value, path) => {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${path} must be non-empty text`);
+  }
+  return value;
+};
+
+const requiredTextArray = (value, path) => {
+  const values = requireArray(value, path);
+  if (values.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new Error(`${path} must contain only non-empty text`);
+  }
+  return values;
+};
+
+const assertSortedUnique = (values, path) => {
+  if (
+    new Set(values).size !== values.length ||
+    values.some((value, index) => index > 0 && value <= values[index - 1])
+  ) {
+    throw new Error(`${path} must be sorted and unique`);
+  }
+};
+
+const verifyFixtureAndDataset = async ({
+  fixture,
+  fixtureBytes,
+  datasetManifestBytes,
+  runtimeDatasetBytes,
+  spec,
+}) => {
+  requireObject(fixture, "fixture manifest");
+  if (fixture.schema !== FIXTURE_SCHEMA) {
+    throw new Error(`Unsupported fixture manifest schema: ${String(fixture.schema)}`);
+  }
+  if (
+    decodeUtf8(fixtureBytes, "spec/fixture-manifest.json") !==
+    canonicalJsonText(fixture)
+  ) {
+    throw new Error("Fixture manifest is not canonical JSON");
+  }
+  const datasetManifest = parseJsonBytes(
+    datasetManifestBytes,
+    "spec/dataset-manifest.json",
+  );
+  const dataset = parseJsonBytes(
+    runtimeDatasetBytes,
+    "spec/runtime-dataset.json",
+  );
+  if (
+    decodeUtf8(datasetManifestBytes, "spec/dataset-manifest.json") !==
+      canonicalJsonText(datasetManifest) ||
+    decodeUtf8(runtimeDatasetBytes, "spec/runtime-dataset.json") !==
+      canonicalJsonText(dataset)
+  ) {
+    throw new Error("Verified dataset artifacts are not canonical JSON");
+  }
+
+  const fixtureDigest = `sha256:${await sha256Hex(fixtureBytes)}`;
+  const datasetManifestDigest =
+    `sha256:${await sha256Hex(datasetManifestBytes)}`;
+  const runtimeDatasetDigest =
+    `sha256:${await sha256Hex(runtimeDatasetBytes)}`;
+  const scope = requireObject(
+    requireObject(spec.contract, "verified contract").scope,
+    "verified contract scope",
+  );
+  if (
+    fixture.dataset_manifest_digest !== datasetManifestDigest ||
+    fixture.runtime_dataset_digest !== runtimeDatasetDigest ||
+    scope.dataset_digest !== runtimeDatasetDigest ||
+    scope.fixture_digest !== fixtureDigest
+  ) {
+    throw new Error("Fixture, dataset and experiment scope are not digest-bound");
+  }
+
+  if (
+    dataset.schema !== DATASET_SCHEMA ||
+    dataset.generator_version !== "financial-support-data/v1" ||
+    !["smoke", "default", "benchmark"].includes(dataset.profile) ||
+    !Number.isSafeInteger(dataset.seed)
+  ) {
+    throw new Error("Runtime dataset descriptor is outside the supported fixture");
+  }
+  const principals = requireArray(dataset.principals, "runtime dataset principals");
+  const customers = requireArray(dataset.customers, "runtime dataset customers");
+  const supportCases = requireArray(
+    dataset.support_cases,
+    "runtime dataset support cases",
+  );
+  if (!principals.length || !customers.length || !supportCases.length) {
+    throw new Error("Runtime dataset cannot be empty");
+  }
+  const principalIds = principals.map((row, index) =>
+    requiredText(
+      requireObject(row, `runtime dataset principal ${index + 1}`).principal_id,
+      `runtime dataset principal ${index + 1}.principal_id`,
+    ),
+  );
+  const customerIds = customers.map((row, index) => {
+    const item = requireObject(row, `runtime dataset customer ${index + 1}`);
+    const customerId = requiredText(
+      item.customer_id,
+      `runtime dataset customer ${index + 1}.customer_id`,
+    );
+    if (
+      !/^SYNTH-CUSTOMER-[0-9]{6}$/.test(customerId) ||
+      item.synthetic !== true
+    ) {
+      throw new Error(`Runtime dataset customer ${index + 1} is not synthetic`);
+    }
+    return customerId;
+  });
+  const caseIds = supportCases.map((row, index) =>
+    requiredText(
+      requireObject(row, `runtime dataset support case ${index + 1}`).case_id,
+      `runtime dataset support case ${index + 1}.case_id`,
+    ),
+  );
+  assertSortedUnique(principalIds, "runtime dataset principal identities");
+  assertSortedUnique(customerIds, "runtime dataset customer identities");
+  assertSortedUnique(caseIds, "runtime dataset support-case identities");
+
+  const attack = requireObject(fixture.attack_action, "fixture.attack_action");
+  const benign = requireObject(fixture.benign_action, "fixture.benign_action");
+  for (const [label, action, count] of [
+    ["attack", attack, 10],
+    ["benign", benign, 1],
+  ]) {
+    if (
+      action.schema !== "assurance-lab.support-action/v1" ||
+      action.principal_id !== "support-017" ||
+      action.role !== "support" ||
+      action.data_class !== "customer_confidential" ||
+      action.records_per_customer !== 1
+    ) {
+      throw new Error(`Fixture ${label} action differs from the fixed scenario`);
+    }
+    const requested = requiredTextArray(
+      action.requested_customer_ids,
+      `fixture.${label}_action.requested_customer_ids`,
+    );
+    assertSortedUnique(requested, `fixture.${label}_action requested customers`);
+    if (
+      requested.length !== count ||
+      requested.some((customerId) => !customerIds.includes(customerId))
+    ) {
+      throw new Error(`Fixture ${label} action is not backed by the runtime dataset`);
+    }
+  }
+  const attackDigest = `sha256:${await sha256Hex(canonicalJsonBytes(attack))}`;
+  const benignDigest = `sha256:${await sha256Hex(canonicalJsonBytes(benign))}`;
+  const inputProfile = requireObject(
+    requireObject(
+      requireObject(spec.contract, "verified contract").profile,
+      "verified contract profile",
+    ).input,
+    "verified profile.input",
+  );
+  if (
+    fixture.attack_action_digest !== attackDigest ||
+    fixture.benign_action_digest !== benignDigest ||
+    inputProfile.attack_action_digest !== attackDigest ||
+    inputProfile.benign_action_digest !== benignDigest
+  ) {
+    throw new Error("Fixture actions are not bound to their canonical digests");
+  }
+
+  const databaseSnapshotDigest =
+    `sha256:${await sha256Hex(
+      canonicalJsonBytes({
+        ...dataset,
+        generator_version: null,
+        profile: null,
+        seed: null,
+      }),
+    )}`;
+  dataset.principalIndex = new Map(
+    principals.map((row) => [row.principal_id, row]),
+  );
+  dataset.customerIndex = new Map(
+    customers.map((row) => [row.customer_id, row]),
+  );
+  dataset.databaseSnapshotDigest = databaseSnapshotDigest;
+  dataset.fileDigest = runtimeDatasetDigest;
+  dataset.fixtureDigest = fixtureDigest;
+  return dataset;
+};
+
+const expectedActionForSelector = (fixture, selector, profile) => {
+  const attackLevel = typedSelectorValue(
+    profile.input.attack,
+    "string",
+    "verified profile.input.attack",
+  );
+  const benignLevel = typedSelectorValue(
+    profile.input.benign,
+    "string",
+    "verified profile.input.benign",
+  );
+  if (selector.input === attackLevel) return fixture.attack_action;
+  if (selector.input === benignLevel) return fixture.benign_action;
+  throw new Error(`Runtime observation has unsupported input selector ${selector.input}`);
+};
+
+const deriveRuntimeTrial = async ({
+  observation,
+  runtimeDigest,
+  attestation,
+  dataset,
+  fixture,
+  profile,
+  specDigest,
+}) => {
+  const trialKey = attestation.trial_key;
+  const selector = attestation.selectorValues;
+  const action = expectedActionForSelector(fixture, selector, profile);
+  const actionDigest =
+    selector.input ===
+    typedSelectorValue(
+      profile.input.attack,
+      "string",
+      "verified profile.input.attack",
+    )
+      ? fixture.attack_action_digest
+      : fixture.benign_action_digest;
+  const expectedTrace =
+    `financial-support-trace-${String(attestation.ordinal).padStart(4, "0")}-` +
+    trialKey.slice(-12);
+  const expectedClone =
+    `sqlite-clone-${String(attestation.ordinal).padStart(4, "0")}-` +
+    trialKey.slice(-12);
+  if (
+    observation.schema_name !== RUNTIME_OBSERVATION_SCHEMA ||
+    observation.id !== `${trialKey}:runtime-observation` ||
+    observation.spec_digest !== specDigest ||
+    observation.trial_key !== trialKey ||
+    observation.trace_id !== expectedTrace ||
+    observation.action_digest !== actionDigest ||
+    attestation.trace_id !== expectedTrace ||
+    attestation.action_digest !== actionDigest ||
+    attestation.runtime_observation_digest !== runtimeDigest ||
+    attestation.clone_unique_instance_id !== expectedClone ||
+    attestation.observed_dataset_digest !== dataset.fileDigest ||
+    attestation.observed_fixture_digest !== dataset.fixtureDigest
+  ) {
+    throw new Error(`Runtime observation ${trialKey} is outside its attested scope`);
+  }
+
+  const principalId = action.principal_id;
+  const requested = requiredTextArray(
+    action.requested_customer_ids,
+    "fixture action requested customers",
+  );
+  const expectedPrincipal = dataset.principalIndex.get(principalId);
+  if (
+    !expectedPrincipal ||
+    expectedPrincipal.role !== "support" ||
+    expectedPrincipal.status !== "active"
+  ) {
+    throw new Error(`Runtime dataset has no active support principal ${principalId}`);
+  }
+  assertJsonEqual(
+    observation.principal_rows,
+    [expectedPrincipal],
+    `Runtime principal query for ${trialKey}`,
+  );
+  const expectedCustomers = [...requested]
+    .sort()
+    .map((customerId) => dataset.customerIndex.get(customerId));
+  if (expectedCustomers.some((row) => !row)) {
+    throw new Error(`Runtime dataset is missing an action customer for ${trialKey}`);
+  }
+  assertJsonEqual(
+    observation.requested_customer_rows,
+    expectedCustomers,
+    `Runtime customer query for ${trialKey}`,
+  );
+  const expectedCases = dataset.support_cases.filter(
+    (row) =>
+      row.assigned_principal_id === principalId && row.status === "active",
+  );
+  assertJsonEqual(
+    observation.assigned_support_case_rows,
+    expectedCases,
+    `Runtime assignment query for ${trialKey}`,
+  );
+  const assignedIds = expectedCases.map((row) => row.customer_id).sort();
+
+  const requestId = `request-${expectedTrace}`;
+  assertJsonEqual(
+    observation.request,
+    {
+      request_id: requestId,
+      trace_id: expectedTrace,
+      action_digest: actionDigest,
+      principal_id: principalId,
+      requested_customer_ids: requested,
+    },
+    `Persisted request for ${trialKey}`,
+  );
+  const allowed =
+    selector.target === "wildcard-misgrant" ||
+    requested.every((customerId) => assignedIds.includes(customerId));
+  const authorizationDecision = allowed ? "allow" : "deny";
+  assertJsonEqual(
+    observation.authorization,
+    {
+      request_id: requestId,
+      target_mode: selector.target,
+      decision: authorizationDecision,
+      allowed,
+      assigned_customer_ids: assignedIds,
+      requested_customer_ids: requested,
+      assigned_rows_evaluated: expectedCases.length,
+      requested_rows_found: expectedCustomers.length,
+    },
+    `Authorization receipt for ${trialKey}`,
+  );
+
+  const selected = allowed ? [...requested].sort() : [];
+  assertJsonEqual(
+    observation.selection,
+    {
+      request_id: requestId,
+      query_id: `selection-${requestId}`,
+      selected_customer_ids: selected,
+      row_count: selected.length,
+    },
+    `Selection receipt for ${trialKey}`,
+  );
+  const reached = allowed;
+  const blocked =
+    reached && selector.compensator === "enforce" && selected.length >= 10;
+  assertJsonEqual(
+    observation.guard,
+    {
+      request_id: requestId,
+      compensator_mode: selector.compensator,
+      reached,
+      decision: !reached ? "not_reached" : blocked ? "block" : "allow",
+      selected_record_count: selected.length,
+      bulk_threshold_records: fixture.bulk_threshold_records,
+    },
+    `Release-gateway receipt for ${trialKey}`,
+  );
+
+  const delivered = !allowed || blocked ? [] : selected;
+  const payloadDigest =
+    `sha256:${await sha256Hex(
+      canonicalJsonBytes({
+        delivered_customer_ids: delivered,
+        trace_id: expectedTrace,
+      }),
+    )}`;
+  assertJsonEqual(
+    observation.delivery,
+    {
+      request_id: requestId,
+      selected_customer_ids: selected,
+      delivered_customer_ids: delivered,
+      payload_digest: payloadDigest,
+    },
+    `Delivery receipt for ${trialKey}`,
+  );
+  assertJsonEqual(
+    observation.client,
+    {
+      request_id: requestId,
+      received_customer_ids: delivered,
+      payload_digest: payloadDigest,
+    },
+    `Client receipt for ${trialKey}`,
+  );
+
+  const resource = requireObject(
+    observation.resource_identity,
+    `Runtime resource identity for ${trialKey}`,
+  );
+  const generation = selector.sham ? 2 : 1;
+  const beforeInstance = `${expectedClone}:generation-1`;
+  const afterInstance = `${expectedClone}:generation-${generation}`;
+  if (
+    resource.requested_clone_nonce !== expectedClone ||
+    resource.observed_clone_nonce !== expectedClone ||
+    resource.requested_runner_resource_id !== RUNNER_RESOURCE_ID ||
+    resource.observed_runner_resource_id !== RUNNER_RESOURCE_ID ||
+    resource.observed_runtime_instance_id !== afterInstance ||
+    resource.observed_generation !== generation ||
+    resource.observed_dataset_snapshot_digest !==
+      dataset.databaseSnapshotDigest
+  ) {
+    throw new Error(`Runtime resource identity is not independently bound for ${trialKey}`);
+  }
+  assertJsonEqual(
+    observation.redeploy_operation,
+    {
+      operation_id: `redeploy-${expectedTrace}`,
+      requested: selector.sham,
+      performed: selector.sham,
+      before_runtime_instance_id: beforeInstance,
+      after_runtime_instance_id: afterInstance,
+      before_dataset_snapshot_digest: dataset.databaseSnapshotDigest,
+      after_dataset_snapshot_digest: dataset.databaseSnapshotDigest,
+      before_principal_count: dataset.principals.length,
+      after_principal_count: dataset.principals.length,
+      before_customer_count: dataset.customers.length,
+      after_customer_count: dataset.customers.length,
+      before_support_case_count: dataset.support_cases.length,
+      after_support_case_count: dataset.support_cases.length,
+      previous_handle_closed: selector.sham,
+    },
+    `Redeploy receipt for ${trialKey}`,
+  );
+
+  const assignedSet = new Set(assignedIds);
+  const outsideSet = new Set(
+    requested.filter((customerId) => !assignedSet.has(customerId)),
+  );
+  return {
+    trialKey,
+    ordinal: attestation.ordinal,
+    selector,
+    action,
+    actionDigest,
+    runtimeDigest,
+    selectedRecords:
+      selected.filter((customerId) => outsideSet.has(customerId)).length *
+      action.records_per_customer,
+    deliveredRecords:
+      delivered.filter((customerId) => outsideSet.has(customerId)).length *
+      action.records_per_customer,
+    assignedRecordsDelivered:
+      delivered.filter((customerId) => assignedSet.has(customerId)).length *
+      action.records_per_customer,
+    guardReached: reached,
+    guardBlocked: blocked,
+  };
+};
+
+const parseRuntimeObservations = async (
+  bytes,
+  manifest,
+  attestations,
+  fixture,
+  dataset,
+  spec,
+) => {
+  const lines = splitJsonLines(
+    bytes,
+    "records/runtime-observations.jsonl",
+  );
+  if (lines.length !== 16 || attestations.size !== 16) {
+    throw new Error("Raw runtime evidence must cover the exact 16-cell experiment");
+  }
+  const profile = requireObject(
+    requireObject(
+      requireObject(spec.contract, "verified contract").profile,
+      "verified contract profile",
+    ),
+    "verified contract profile",
+  );
+  const scope = requireObject(spec.contract.scope, "verified contract scope");
+  const results = new Map();
+  const cloneIds = new Set();
+  for (const [index, lineBytes] of lines.entries()) {
+    const label = `runtime observation ${index + 1}`;
+    const observation = parseJsonBytes(lineBytes, label);
+    requireObject(observation, label);
+    if (decodeUtf8(lineBytes, label) !== canonicalJsonText(observation)) {
+      throw new Error(`${label} is not canonical JSON`);
+    }
+    if (!DIGEST_PATTERN.test(observation.trial_key)) {
+      throw new Error(`${label} has a malformed trial key`);
+    }
+    const attestation = attestations.get(observation.trial_key);
+    if (!attestation) {
+      throw new Error(`${label} has no matching trial attestation`);
+    }
+    if (
+      attestation.observed_build_digest !== scope.build_digest ||
+      cloneIds.has(attestation.clone_unique_instance_id) ||
+      results.has(observation.trial_key)
+    ) {
+      throw new Error(`${label} reuses or misstates an attested runtime identity`);
+    }
+    cloneIds.add(attestation.clone_unique_instance_id);
+    const runtimeDigest = `sha256:${await sha256Hex(lineBytes)}`;
+    results.set(
+      observation.trial_key,
+      await deriveRuntimeTrial({
+        observation,
+        runtimeDigest,
+        attestation,
+        dataset,
+        fixture,
+        profile,
+        specDigest: manifest.experiment.spec_digest,
+      }),
+    );
+  }
+  if (
+    results.size !== attestations.size ||
+    [...attestations.keys()].some((trialKey) => !results.has(trialKey))
+  ) {
+    throw new Error("Runtime observations and trial attestations are not one-to-one");
+  }
+  return results;
+};
+
 const parseTrialAttestations = (bytes, manifest, caseData) => {
   const attestations = new Map();
-  const lines = splitJsonLines(bytes);
+  const lines = splitJsonLines(bytes, "artifacts/trial-attestations.jsonl");
   if (lines.length === 0) {
     throw new Error("artifacts/trial-attestations.jsonl is empty");
   }
@@ -316,9 +908,15 @@ const parseTrialAttestations = (bytes, manifest, caseData) => {
         "assurance-lab.financial-support-attestation/v1" ||
       !DIGEST_PATTERN.test(attestation.trial_key) ||
       !DIGEST_PATTERN.test(attestation.action_digest) ||
+      !DIGEST_PATTERN.test(attestation.runtime_observation_digest) ||
+      !DIGEST_PATTERN.test(attestation.observed_dataset_digest) ||
+      !DIGEST_PATTERN.test(attestation.observed_fixture_digest) ||
       attestation.spec_digest !== manifest.experiment.spec_digest ||
       attestation.time_basis !== caseData.time_basis ||
       attestation.block !== "sqlite-fresh-clone" ||
+      attestation.runner_resource_id !== RUNNER_RESOURCE_ID ||
+      !Number.isSafeInteger(attestation.ordinal) ||
+      attestation.ordinal < 1 ||
       typeof attestation.clone_unique_instance_id !== "string" ||
       attestation.clone_unique_instance_id.length === 0
     ) {
@@ -361,7 +959,7 @@ const parseTrialAttestations = (bytes, manifest, caseData) => {
 const parseStageEvents = async (bytes, manifest, caseData) => {
   const byTrialAndStage = new Map();
   const seenDigests = new Set();
-  const lines = splitJsonLines(bytes);
+  const lines = splitJsonLines(bytes, "records/stage-events.jsonl");
   if (lines.length === 0) {
     throw new Error("records/stage-events.jsonl is empty");
   }
@@ -456,6 +1054,15 @@ const verifiedStage = (
   return raw.event;
 };
 
+const rawStageDigest = (verification, trialKey, stage, allowMissing = false) => {
+  const raw = verification.stageIndex.get(stageKey(trialKey, stage));
+  if (!raw && allowMissing) return null;
+  if (!raw) {
+    throw new Error(`Raw runtime trial ${trialKey} has no ${stage} stage summary`);
+  }
+  return raw.digest;
+};
+
 const verifiedAttestedInput = (
   caseData,
   verification,
@@ -529,7 +1136,7 @@ const verifyRequestSummary = async (
   profile,
 ) => {
   const fixture = requireObject(verification.fixture, "fixture manifest");
-  if (fixture.schema !== "assurance-lab.financial-support-fixture/v2") {
+  if (fixture.schema !== FIXTURE_SCHEMA) {
     throw new Error("Fixture manifest does not expose a verified request summary");
   }
   const attack = requireObject(fixture.attack_action, "fixture.attack_action");
@@ -577,9 +1184,9 @@ const verifyRequestSummary = async (
   ) {
     throw new Error("Current request customer identifiers disagree with the fixture");
   }
-  const canonicalAttack = new TextEncoder().encode(JSON.stringify(attack));
+  const canonicalAttack = canonicalJsonBytes(attack);
   const attackDigest = `sha256:${await sha256Hex(canonicalAttack)}`;
-  const canonicalBenign = new TextEncoder().encode(JSON.stringify(benign));
+  const canonicalBenign = canonicalJsonBytes(benign);
   const benignDigest = `sha256:${await sha256Hex(canonicalBenign)}`;
   if (
     attackDigest !== fixture.attack_action_digest ||
@@ -611,40 +1218,21 @@ const verifyRequestSummary = async (
     request.action_digest,
     "Current input envelope action digest",
   );
-  return request;
+  return expected;
 };
 
 const verifyDisplayedFacts = async (caseData, verification) => {
   const contract = requireObject(verification.spec.contract, "verified contract");
   const profile = requireObject(contract.profile, "verified contract profile");
-  const current = requireObject(caseData.current, "case.current");
+  const declaredCurrent = requireObject(caseData.current, "case.current");
   if (
-    !DIGEST_PATTERN.test(current.trial_key) ||
-    !Number.isSafeInteger(current.selected_records) ||
-    !Number.isSafeInteger(current.delivered_records) ||
-    typeof current.guard_blocked !== "boolean"
+    !DIGEST_PATTERN.test(declaredCurrent.trial_key) ||
+    !Number.isSafeInteger(declaredCurrent.selected_records) ||
+    !Number.isSafeInteger(declaredCurrent.delivered_records) ||
+    typeof declaredCurrent.guard_blocked !== "boolean"
   ) {
     throw new Error("Current case observation is malformed");
   }
-
-  const inputReference = caseStageReference(
-    caseData,
-    current.trial_key,
-    "input",
-  );
-  const currentInput = verifiedStage(
-    caseData,
-    verification,
-    current.trial_key,
-    "input",
-    inputReference.artifact_digest,
-  );
-  const request = await verifyRequestSummary(
-    caseData,
-    verification,
-    currentInput,
-    profile,
-  );
 
   const targetField = metricPayloadName(
     profile.target_metric_id,
@@ -729,6 +1317,83 @@ const verifyDisplayedFacts = async (caseData, verification) => {
   ) {
     throw new Error("Verified experiment selector levels are not distinguishable");
   }
+
+  const rawTrials = [...verification.runtimeIndex.values()];
+  const observedFullSelectors = new Set(
+    rawTrials.map((trial) => selectorSignature(trial.selector)),
+  );
+  const expectedFullSelectors = new Set();
+  for (const input of [selectorDesign.attack, selectorDesign.benign]) {
+    for (const target of [
+      selectorDesign.targetEffective,
+      selectorDesign.targetIneffective,
+    ]) {
+      for (const compensator of [
+        selectorDesign.guardOn,
+        selectorDesign.guardOff,
+      ]) {
+        for (const sham of [
+          selectorDesign.shamSteady,
+          selectorDesign.shamRedeploy,
+        ]) {
+          expectedFullSelectors.add(
+            selectorSignature({ input, target, compensator, sham }),
+          );
+        }
+      }
+    }
+  }
+  requireExactSelectorSet(
+    observedFullSelectors,
+    expectedFullSelectors,
+    "Raw 16-cell runtime evidence",
+  );
+  const currentMatches = rawTrials.filter(
+    (trial) =>
+      trial.selector.input === selectorDesign.attack &&
+      trial.selector.target === selectorDesign.targetCurrent &&
+      trial.selector.compensator === selectorDesign.guardCurrent &&
+      trial.selector.sham === selectorDesign.shamSteady,
+  );
+  if (currentMatches.length !== 1) {
+    throw new Error("Raw runtime evidence has no unique current intervention cell");
+  }
+  const currentRawTrial = currentMatches[0];
+  const current = {
+    trial_key: currentRawTrial.trialKey,
+    selected_records: currentRawTrial.selectedRecords,
+    delivered_records: currentRawTrial.deliveredRecords,
+    guard_blocked: currentRawTrial.guardBlocked,
+  };
+  assertJsonEqual(
+    declaredCurrent,
+    current,
+    "CLI current observation",
+  );
+  const inputReference = caseStageReference(
+    caseData,
+    current.trial_key,
+    "input",
+  );
+  const currentInput = verifiedStage(
+    caseData,
+    verification,
+    current.trial_key,
+    "input",
+    inputReference.artifact_digest,
+  );
+  const request = await verifyRequestSummary(
+    caseData,
+    verification,
+    currentInput,
+    profile,
+  );
+  if (
+    request.action_digest !== currentRawTrial.actionDigest ||
+    !sameJson(request.requested_customer_ids, currentRawTrial.action.requested_customer_ids)
+  ) {
+    throw new Error("Displayed request differs from the raw runtime action");
+  }
   const fixtureAttackDigest = verification.fixture.attack_action_digest;
   const fixtureBenignDigest = verification.fixture.benign_action_digest;
 
@@ -784,13 +1449,66 @@ const verifyDisplayedFacts = async (caseData, verification) => {
     "Current delivered-record count",
   );
 
-  const matrix = requireArray(
+  const declaredMatrix = requireArray(
     caseData.steady_attack_matrix,
     "case.steady_attack_matrix",
   );
-  if (matrix.length !== 4) {
+  if (declaredMatrix.length !== 4) {
     throw new Error("Displayed attack matrix must contain four cells");
   }
+  const rawMatrix = [];
+  for (const target of [
+    selectorDesign.targetIneffective,
+    selectorDesign.targetEffective,
+  ]) {
+    for (const compensator of [
+      selectorDesign.guardOff,
+      selectorDesign.guardOn,
+    ]) {
+      const matches = rawTrials.filter(
+        (trial) =>
+          trial.selector.input === selectorDesign.attack &&
+          trial.selector.target === target &&
+          trial.selector.compensator === compensator &&
+          trial.selector.sham === selectorDesign.shamSteady,
+      );
+      if (matches.length !== 1) {
+        throw new Error(`Raw runtime evidence has no unique matrix cell for ${target}/${compensator}`);
+      }
+      const trial = matches[0];
+      rawMatrix.push({
+        trial_key: trial.trialKey,
+        target_level: target,
+        compensator_level: compensator,
+        selected_records: trial.selectedRecords,
+        guard_state: !trial.guardReached
+          ? "skipped_by_target"
+          : trial.guardBlocked
+            ? "executed_blocked"
+            : "executed_allowed",
+        delivered_records: trial.deliveredRecords,
+        target_artifact_digest: rawStageDigest(
+          verification,
+          trial.trialKey,
+          "target",
+        ),
+        compensator_artifact_digest: trial.guardReached
+          ? rawStageDigest(verification, trial.trialKey, "compensator")
+          : null,
+        outcome_artifact_digest: rawStageDigest(
+          verification,
+          trial.trialKey,
+          "outcome",
+        ),
+      });
+    }
+  }
+  assertJsonEqual(
+    declaredMatrix,
+    rawMatrix,
+    "CLI attack matrix",
+  );
+  const matrix = rawMatrix;
   const matrixTrials = new Set();
   const displayedCloneIds = new Set();
   const observedAttackSelectors = new Set();
@@ -928,13 +1646,30 @@ const verifyDisplayedFacts = async (caseData, verification) => {
     throw new Error("Current observation is not the verified current intervention cell");
   }
 
-  const benignOutcomes = requireArray(
+  const declaredBenignOutcomes = requireArray(
     caseData.benign_outcomes,
     "case.benign_outcomes",
   );
-  if (benignOutcomes.length !== 8) {
+  if (declaredBenignOutcomes.length !== 8) {
     throw new Error("Displayed benign service envelope must contain eight cells");
   }
+  const benignOutcomes = rawTrials
+    .filter((trial) => trial.selector.input === selectorDesign.benign)
+    .sort((left, right) => left.ordinal - right.ordinal)
+    .map((trial) => ({
+      trial_key: trial.trialKey,
+      assigned_records_delivered: trial.assignedRecordsDelivered,
+      artifact_digest: rawStageDigest(
+        verification,
+        trial.trialKey,
+        "outcome",
+      ),
+    }));
+  assertJsonEqual(
+    declaredBenignOutcomes,
+    benignOutcomes,
+    "CLI benign service envelope",
+  );
   const benignTrials = new Set();
   const observedBenignSelectors = new Set();
   const expectedBenignSelectors = new Set();
@@ -1008,6 +1743,9 @@ const verifyDisplayedFacts = async (caseData, verification) => {
   return {
     profile,
     request,
+    current,
+    matrix,
+    benignOutcomes,
     currentRaw: {
       selected: payloadValue(currentTarget, targetField),
       blocked: payloadValue(currentGuard, guardField),
@@ -1293,58 +2031,52 @@ const renderBenign = (outcomes) => {
   );
 };
 
-const findArtifact = (artifacts, trialKey, stage) =>
-  artifacts.find(
-    (artifact) => artifact.trial_key === trialKey && artifact.stage === stage,
-  );
-
-const artifactDigest = (artifact, label) =>
-  required(artifact?.artifact_digest, `stage_artifacts.${label}.artifact_digest`);
-
-const renderEvidence = (data, verification) => {
+const renderEvidence = (data, verification, facts) => {
+  const current = facts.current;
+  const currentRuntime = verification.runtimeIndex.get(current.trial_key);
+  if (!currentRuntime) {
+    throw new Error("Current display has no raw runtime observation");
+  }
   const evidence = [
     {
       label: "Entitlement query",
-      raw: `out_of_scope_records_selected = ${data.current.selected_records}`,
+      raw: `out_of_scope_records_selected = ${current.selected_records}`,
       digests: [
-        artifactDigest(
-          findArtifact(data.stage_artifacts, data.current.trial_key, "target"),
-          "current.target",
-        ),
+        currentRuntime.runtimeDigest,
+        rawStageDigest(verification, current.trial_key, "target"),
       ],
     },
     {
       label: "Release decision",
-      raw: `unapproved_release_blocked = ${data.current.guard_blocked}`,
+      raw: `unapproved_release_blocked = ${current.guard_blocked}`,
       digests: [
-        artifactDigest(
-          findArtifact(data.stage_artifacts, data.current.trial_key, "compensator"),
-          "current.compensator",
-        ),
+        currentRuntime.runtimeDigest,
+        rawStageDigest(verification, current.trial_key, "compensator"),
       ],
     },
     {
       label: "Outside boundary",
-      raw: `out_of_scope_records_delivered = ${data.current.delivered_records}`,
+      raw: `out_of_scope_records_delivered = ${current.delivered_records}`,
       digests: [
-        artifactDigest(
-          findArtifact(data.stage_artifacts, data.current.trial_key, "outcome"),
-          "current.outcome",
-        ),
+        currentRuntime.runtimeDigest,
+        rawStageDigest(verification, current.trial_key, "outcome"),
       ],
     },
     {
       label: "Benign service envelope",
-      raw: `assigned_case_records_delivered = [${data.benign_outcomes
+      raw: `assigned_case_records_delivered = [${facts.benignOutcomes
         .map((item) => item.assigned_records_delivered)
         .join(",")}]`,
-      digests: data.benign_outcomes.map((item) => item.artifact_digest),
+      digests: facts.benignOutcomes.flatMap((item) => [
+        verification.runtimeIndex.get(item.trial_key).runtimeDigest,
+        item.artifact_digest,
+      ]),
     },
   ];
 
   setText(
     "evidence-boundary",
-    "Browser: verified the raw manifest and every listed file, matched every displayed fact to its hashed stage line and attested selector, and checked the primary current-cell verdict against the verified safe values. Run the CLI to recompute the full semantic decision, including 16-cell protocol and contrast completeness. Integrity-only: source origin is not authenticated.",
+    "Browser: verified the manifest and every listed file, reconstructed all 16 cells from the exact dataset rows and persisted SQLite request, authorization, selection, guard, delivery and client receipts, then cross-checked each displayed fact against its stage line and attested selector. Integrity-only: source origin is not authenticated.",
   );
 
   const meta = byId("evidence-meta");
@@ -1380,10 +2112,10 @@ const renderLimitations = (limitations) => {
 };
 
 const render = (data, verification, facts, decision) => {
-  const current = data.current;
+  const current = facts.current;
   const request = facts.request;
   const claims = Object.fromEntries(
-    data.primary_claims.map((claim) => [claim.role, claim]),
+    Object.entries(decision.truths).map(([role, truth]) => [role, { truth }]),
   );
 
   document.title = "Nothing left. The first control still failed. — Control Assurance";
@@ -1455,9 +2187,9 @@ const render = (data, verification, facts, decision) => {
       "The entitlement boundary failed while the release guard succeeded. Treating the final zero as shared success would preserve a silent single point of failure.",
   });
 
-  renderMatrix(data.steady_attack_matrix, current.trial_key);
-  renderBenign(data.benign_outcomes);
-  renderEvidence(data, verification);
+  renderMatrix(facts.matrix, current.trial_key);
+  renderBenign(facts.benignOutcomes);
+  renderEvidence(data, verification, facts);
   renderLimitations(data.limitations);
 
   if (window.location.hash === "#evidence") {
@@ -1502,4 +2234,15 @@ const start = async () => {
   render(data, verification, facts, decision);
 };
 
-start().catch(fail);
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    canonicalJsonBytes,
+    parseRuntimeObservations,
+    parseStageEvents,
+    parseTrialAttestations,
+    verifyDisplayedFacts,
+    verifyFixtureAndDataset,
+  };
+} else {
+  start().catch(fail);
+}

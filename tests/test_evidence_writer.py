@@ -9,6 +9,7 @@ import pytest
 from assurance_lab.evidence import writer as writer_module
 from assurance_lab.evidence.bundle import (
     BundleStatus,
+    BundleVerification,
     EvaluationRef,
     EvaluatorRef,
     ExperimentRef,
@@ -137,9 +138,9 @@ def test_writer_rejects_destination_root_swap_to_foreign_valid_bundle(
         metadata=_metadata(),
         payloads=_payloads(),
     )
-    real_verify = writer_module.verify_bundle
+    real_verify = verify_bundle
 
-    def swap_then_verify(path: Path):
+    def swap_then_verify(path: Path) -> BundleVerification:
         path.rename(displaced)
         foreign.rename(path)
         return real_verify(path)

@@ -4,9 +4,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+import rfc8785
 from pydantic import ValidationError
 
-import assurance_lab.contract as contract_module
 from assurance_lab.contract import (
     I_JSON_MAX_INTEGER,
     MAX_BLOCKS,
@@ -554,8 +554,8 @@ def test_canonicalization_errors_use_the_contract_error_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail_canonicalization(_: object) -> bytes:
-        raise contract_module.rfc8785.CanonicalizationError("invalid canonical value")
+        raise rfc8785.CanonicalizationError("invalid canonical value")
 
-    monkeypatch.setattr(contract_module.rfc8785, "dumps", fail_canonicalization)
+    monkeypatch.setattr(rfc8785, "dumps", fail_canonicalization)
     with pytest.raises(ContractCompileError, match="canonicalization failed"):
         compile_experiment(valid_contract())

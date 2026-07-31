@@ -53,8 +53,8 @@ requested state change actually occurred.
 
 ### Observation and evidence
 
-An observation is a typed fact produced by a collector. Evidence is an immutable
-artifact or excerpt that supports the observation and carries:
+An observation is a typed fact produced by a collector. Evidence is a
+content-addressed artifact or excerpt that supports the observation and carries:
 
 - source identity and collector version;
 - collection time and clock information;
@@ -66,7 +66,8 @@ artifact or excerpt that supports the observation and carries:
 - optional signature or external attestation.
 
 A SHA-256 digest detects later byte changes when a trusted digest is available. It
-does not, on its own, prove who produced the artifact.
+does not, on its own, prove who produced the artifact or make a mutable directory
+immutable.
 
 ### Assumption and defeater
 

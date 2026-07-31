@@ -4,14 +4,32 @@ build-backend = "hatchling.build"
 
 [project]
 name = "control-assurance-lab"
-version = "0.0.1"
-description = "Experimental security-control assurance engine"
-requires-python = ">=3.12"
-license = { text = "Apache-2.0" }
+version = "0.1.0"
+description = "Reproducible experiments that expose security-control failures masked by safe outcomes"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
   { name = "Gyubin Lee" },
 ]
+keywords = [
+  "control assurance",
+  "evidence",
+  "reproducible security",
+  "security testing",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+]
 dependencies = [
+  "cryptography>=48.0.1,<49",
   "pydantic>=2.12,<3",
   "PyYAML>=6.0.2,<7",
   "rfc8785>=0.1.4,<1",
@@ -19,18 +37,48 @@ dependencies = [
 
 [project.scripts]
 assurance-lab = "assurance_lab.cli:main"
+assurance-control-plane = "assurance_lab.control_plane.service_cli:main"
+assurance-deployment-reconciler = "assurance_lab.control_plane.reconciler_cli:main"
+assurance-runtime-worker = "assurance_lab.runtime.service_cli:main"
+
+[project.urls]
+Issues = "https://github.com/gyubin02/control-assurance-lab/issues"
+Repository = "https://github.com/gyubin02/control-assurance-lab"
 
 [project.optional-dependencies]
+control-plane = [
+  "fastapi>=0.140,<0.141",
+  "httpx>=0.28,<0.29",
+  "jinja2>=3.1,<4",
+  "psycopg[binary,pool]>=3.3,<3.4",
+  "uvicorn>=0.52,<0.53",
+]
+runtime-worker = [
+  "boto3>=1.42,<2",
+  "psycopg[binary,pool]>=3.3,<3.4",
+]
 dev = [
+  "hatchling>=1.26,<2",
   "hypothesis>=6.130,<7",
+  "httpx2>=2.9,<3",
   "mypy>=1.15,<2",
-  "pytest>=8.3,<9",
+  "pip-audit>=2.10.1,<3",
+  "pytest>=9.0.3,<10",
   "pytest-cov>=6,<7",
   "ruff>=0.11,<1",
+  "types-PyYAML>=6.0.12,<7",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/assurance_lab"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"verifier-js/package.json" = "assurance_lab/_release_assets/verifier-js/package.json"
+"verifier-js/src" = "assurance_lab/_release_assets/verifier-js/src"
+
+[tool.hatch.build.targets.sdist.force-include]
+"verifier-js/package.json" = "verifier-js/package.json"
+"verifier-js/src" = "verifier-js/src"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"

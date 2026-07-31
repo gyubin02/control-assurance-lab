@@ -102,9 +102,109 @@ def test_monitor_only_exposes_the_failed_path(runtime: FinancialSupportRuntime) 
     assert result.selected_customer_ids == result.delivered_customer_ids
 
 
+def test_runner_identity_is_persisted_read_back_and_closed_after_the_trial(
+    runtime: FinancialSupportRuntime,
+) -> None:
+    result = runtime.execute(
+        _selector(attack=False, target_effective=True, guard_on=True),
+        trace_id="trace-resource-receipts",
+        clone_nonce="runner-chosen-clone-0001",
+        runner_resource_id="test-sqlite-runner",
+    )
+
+    identity = result.resource_identity
+    assert identity.requested_clone_nonce == "runner-chosen-clone-0001"
+    assert identity.observed_clone_nonce == identity.requested_clone_nonce
+    assert identity.requested_runner_resource_id == "test-sqlite-runner"
+    assert identity.observed_runner_resource_id == identity.requested_runner_resource_id
+    assert identity.observed_runtime_instance_id == (
+        "runner-chosen-clone-0001:generation-1"
+    )
+    assert identity.observed_generation == 1
+
+    cleanup = result.cleanup_probe
+    assert cleanup.clone_nonce == identity.observed_clone_nonce
+    assert cleanup.runner_resource_id == identity.observed_runner_resource_id
+    assert cleanup.runtime_instance_id == identity.observed_runtime_instance_id
+    assert cleanup.probe_operation == "select-runtime-identity-after-close"
+    assert cleanup.error_type == "sqlite3.ProgrammingError"
+    assert cleanup.closed_handle_rejected_operation is True
+
+
+@pytest.mark.parametrize("sham", (False, True))
+def test_redeploy_receipt_records_the_actual_pre_and_post_operation(
+    runtime: FinancialSupportRuntime,
+    sham: bool,
+) -> None:
+    clone_nonce = f"redeploy-receipt-{int(sham)}"
+    result = runtime.execute(
+        _selector(
+            attack=False,
+            target_effective=True,
+            guard_on=True,
+            sham=sham,
+        ),
+        trace_id=f"trace-redeploy-receipt-{int(sham)}",
+        clone_nonce=clone_nonce,
+    )
+
+    operation = result.redeploy_operation
+    assert operation.requested is sham
+    assert operation.performed is sham
+    assert operation.before_runtime_instance_id == f"{clone_nonce}:generation-1"
+    assert operation.after_runtime_instance_id == (
+        f"{clone_nonce}:generation-2" if sham else f"{clone_nonce}:generation-1"
+    )
+    assert operation.previous_handle_closed is sham
+    assert operation.before_dataset_snapshot_digest == (
+        operation.after_dataset_snapshot_digest
+    )
+    assert (
+        operation.before_principal_count,
+        operation.before_customer_count,
+        operation.before_support_case_count,
+    ) == (
+        operation.after_principal_count,
+        operation.after_customer_count,
+        operation.after_support_case_count,
+    )
+    assert result.resource_identity.observed_generation == (2 if sham else 1)
+    assert result.resource_identity.observed_runtime_instance_id == (
+        operation.after_runtime_instance_id
+    )
+
+
+def test_persisted_receipts_join_one_request_from_source_rows_to_client(
+    runtime: FinancialSupportRuntime,
+) -> None:
+    result = runtime.execute(
+        _selector(attack=True, target_effective=False, guard_on=True),
+        trace_id="trace-persisted-join",
+        clone_nonce="persisted-join-clone",
+    )
+
+    request_id = result.request_receipt.request_id
+    assert request_id == "request-trace-persisted-join"
+    assert result.request_receipt.requested_customer_ids == tuple(
+        row.customer_id for row in result.requested_customer_rows
+    )
+    assert result.authorization_receipt.request_id == request_id
+    assert result.authorization_receipt.assigned_customer_ids == tuple(
+        row.customer_id for row in result.assigned_support_case_rows
+    )
+    assert result.selection_receipt.request_id == request_id
+    assert result.guard_receipt.request_id == request_id
+    assert result.delivery_receipt.request_id == request_id
+    assert result.client_receipt.request_id == request_id
+    assert result.delivery_receipt.payload_digest == result.client_receipt.payload_digest
+    assert result.delivery_receipt.delivered_customer_ids == (
+        result.client_receipt.received_customer_ids
+    )
+
+
 @pytest.mark.parametrize(
     ("target_effective", "guard_on", "sham"),
-    itertools.product((False, True), repeat=3),
+    tuple(itertools.product((False, True), repeat=3)),
 )
 def test_assigned_case_service_survives_every_intervention(
     runtime: FinancialSupportRuntime,
@@ -130,7 +230,7 @@ def test_assigned_case_service_survives_every_intervention(
 
 @pytest.mark.parametrize(
     ("target_effective", "guard_on"),
-    itertools.product((False, True), repeat=2),
+    tuple(itertools.product((False, True), repeat=2)),
 )
 def test_primary_attack_matrix_matches_the_independent_oracle(
     runtime: FinancialSupportRuntime,
