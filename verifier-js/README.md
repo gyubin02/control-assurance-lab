@@ -118,7 +118,7 @@ node ./src/elastic-security-cli.js \
   --receipt ../capture/receipt.json \
   --expected-request ../capture/expected-request.json \
   --expected-endpoint-origin-digest sha256:... \
-  --expected-connector-version 0.1.0 \
+  --expected-connector-version 0.1.1 \
   --records-output ../capture/records.jsonl
 ```
 
@@ -164,7 +164,7 @@ node ./src/defender-xdr-cli.js \
   --receipt ../capture/receipt.json \
   --expected-request ../capture/expected-request.json \
   --expected-endpoint-origin-digest sha256:... \
-  --expected-connector-version 0.1.0 \
+  --expected-connector-version 0.1.1 \
   --records-output ../capture/records.jsonl
 ```
 

@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from assurance_lab._version import __version__
 from assurance_lab.connectors.contract import ConnectorCapture, ConnectorDescriptor
 from assurance_lab.connectors.defender_pam import (
     ManagedDefenderCapture,
@@ -209,7 +210,7 @@ class _ElasticBroker:
         self.endpoint_origin_digest = endpoint_digest
         self.descriptor = descriptor or ConnectorDescriptor(
             connector_id=ELASTIC_SECURITY_CONNECTOR_ID,
-            connector_version="0.1.0",
+            connector_version=__version__,
             capture_media_type=ELASTIC_SECURITY_CAPTURE_MEDIA_TYPE,
         )
         self.ttl: int | None = None
@@ -247,7 +248,7 @@ class _DefenderBroker:
             capture=_capture(
                 ConnectorDescriptor(
                     connector_id=DEFENDER_XDR_CONNECTOR_ID,
-                    connector_version="0.1.0",
+                    connector_version=__version__,
                     capture_media_type=DEFENDER_XDR_CAPTURE_MEDIA_TYPE,
                 )
             ),
@@ -320,7 +321,7 @@ def test_elastic_capture_with_a_different_descriptor_is_withheld() -> None:
         ),
         descriptor=ConnectorDescriptor(
             connector_id="another-elastic-collector",
-            connector_version="0.1.0",
+            connector_version=__version__,
             capture_media_type=ELASTIC_SECURITY_CAPTURE_MEDIA_TYPE,
         ),
     )

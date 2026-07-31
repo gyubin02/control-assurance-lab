@@ -118,6 +118,12 @@ def test_release_repeats_every_source_and_distribution_gate_on_the_tag() -> None
 
 def test_release_scans_the_exact_unpublished_layout_on_both_platforms() -> None:
     build = _release_step("build-scan", "Build the unpublished multi-platform OCI layout")
+    canonicalize = _release_step(
+        "build-scan", "Canonicalize the BuildKit content-store layout"
+    )
+    close = _release_step(
+        "build-scan", "Close the layout over both images and both attestations"
+    )
     assert build["with"]["push"] is False
     assert build["with"]["platforms"] == "linux/amd64,linux/arm64"
     assert "type=oci" in build["with"]["outputs"]
@@ -128,6 +134,18 @@ def test_release_scans_the_exact_unpublished_layout_on_both_platforms() -> None:
         "generator=docker/buildkit-syft-scanner@"
         "sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68"
     )
+    assert canonicalize["env"]["LAYOUT"] == "${{ runner.temp }}/control-assurance-oci"
+    assert (
+        'python scripts/canonicalize-buildkit-layout.py "$LAYOUT"'
+        in canonicalize["run"]
+    )
+    step_names = [
+        step.get("name")
+        for step in _RELEASE["jobs"]["build-scan"]["steps"]
+        if isinstance(step, dict)
+    ]
+    assert step_names.index(build["name"]) < step_names.index(canonicalize["name"])
+    assert step_names.index(canonicalize["name"]) < step_names.index(close["name"])
     assert "docker/login-action@" not in yaml.safe_dump(_RELEASE["jobs"]["build-scan"])
     assert _RELEASE_WORKFLOW.count("TRIVY_PLATFORM: linux/amd64") == 1
     assert _RELEASE_WORKFLOW.count("TRIVY_PLATFORM: linux/arm64") == 1

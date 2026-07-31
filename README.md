@@ -1,11 +1,11 @@
 # Control Assurance Lab
 
 [![CI](https://github.com/gyubin02/control-assurance-lab/actions/workflows/checks.yml/badge.svg)](https://github.com/gyubin02/control-assurance-lab/actions/workflows/checks.yml)
-[![Release](https://img.shields.io/github/v/release/gyubin02/control-assurance-lab?display_name=tag&sort=semver)](https://github.com/gyubin02/control-assurance-lab/releases/tag/v0.1.0)
+[![Release](https://img.shields.io/github/v/release/gyubin02/control-assurance-lab?display_name=tag&sort=semver)](https://github.com/gyubin02/control-assurance-lab/releases/tag/v0.1.1)
 [![License](https://img.shields.io/badge/license-Apache--2.0-1f4b3f.svg)](LICENSE)
 
 Control Assurance Lab identifies which security control failed—even when a
-downstream safeguard kept the final outcome safe. v0.1.0 combines reproducible
+downstream safeguard kept the final outcome safe. v0.1.1 combines reproducible
 matched-intervention experiments with an identity-bound evidence runtime and a
 change-controlled web control plane.
 
@@ -15,11 +15,11 @@ change-controlled web control plane.
 
 ![Control Assurance change desk with an applied first generation and a second generation awaiting independent review](docs/assets/control-plane-hero.png)
 
-*The real v0.1.0 interface with synthetic operator data. Production access
+*The real v0.1.1 interface with synthetic operator data. Production access
 requires SSO; no demo login is shipped.*
 
 [Inspect the verified case](https://gyubin02.github.io/control-assurance-lab/web/)
-· [Read the v0.1.0 release](https://github.com/gyubin02/control-assurance-lab/releases/tag/v0.1.0)
+· [Read the v0.1.1 release](https://github.com/gyubin02/control-assurance-lab/releases/tag/v0.1.1)
 · [Review the pilot boundary](docs/financial-pilot-boundary.md)
 
 ## Why this exists
@@ -53,7 +53,7 @@ Python 3.12.x is required. The upper bound is intentional: the locked
 environment and release image are not qualified on Python 3.13.
 
 ```bash
-git clone --branch v0.1.0 --depth 1 \
+git clone --branch v0.1.1 --depth 1 \
   https://github.com/gyubin02/control-assurance-lab.git
 cd control-assurance-lab
 
@@ -115,10 +115,10 @@ assurance-lab benchmark release verify /tmp/financial-control-lifecycle-v1
 That build runs three synthetic scenarios, 16 factorial cells per scenario,
 and three exact replicates per cell: 144 executions. It also replays the frozen
 C01–C20 corruption corpus and requires the Python and Node evaluators to agree.
-v0.1.0 does not include a precomputed benchmark result; the command creates a
+v0.1.1 does not include a precomputed benchmark result; the command creates a
 local, content-closed result.
 
-## What ships in v0.1.0
+## What ships in v0.1.1
 
 | Surface | Implemented boundary |
 |---|---|
@@ -217,12 +217,12 @@ arbitrary experiment profiles.
 
 ## Container release
 
-The `v0.1.0` tag publishes the same source as a non-root `linux/amd64` and
+The `v0.1.1` tag publishes the same source as a non-root `linux/amd64` and
 `linux/arm64` image:
 
 ```bash
-docker pull ghcr.io/gyubin02/control-assurance-lab:0.1.0
-docker run --rm ghcr.io/gyubin02/control-assurance-lab:0.1.0 \
+docker pull ghcr.io/gyubin02/control-assurance-lab:0.1.1
+docker run --rm ghcr.io/gyubin02/control-assurance-lab:0.1.1 \
   assurance-lab --version
 ```
 
